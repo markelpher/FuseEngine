@@ -21,7 +21,7 @@ State verified on **2026-09-04**. The repository contains the current working-tr
 7. When changing a render stage, preserve OpenGL state, framebuffer attachments, HDR/linear format, and the depth/blend/cull state expected by later stages.
 8. Before creating a second calculation for water, waterline, clouds, or lighting, look for the existing shared calculation. Water already publishes surface data for underwater effects; clouds and ocean receive simulation time from the runtime.
 9. The editor’s Play mode must continue using the runtime copied by the post-build target in `Blowtorch.csproj`. Changes to the `Fuse` executable must be built before validating F5 in the editor.
-10. Build both projects after a relevant change. There is no automated test suite; visual validation in the editor/game and log inspection are part of the process.
+10. Build both projects after a relevant change. Spider locomotion has headless regression harnesses under `tests/`; visual validation in the editor/game and log inspection are still required.
 
 ## Repository structure
 
@@ -187,6 +187,41 @@ Hi-Z patch occlusion is optional and disabled by default in `ProceduralGrassSett
 `OceanRenderer` owns the visual three-cascade spectral/FFT ocean, camera-following adaptive mesh, compute simulation/resolve, detail normal map `res/Textures/ocean_normal.png`, reflection/refraction/foam, and the surface/depth sidecar for underwater composition. `OceanSurfaceSampler` is the shared CPU representation of the same H0 spectrum, dispersion, displacement, normal, and wave velocity used by waterline and physics queries; physics keeps a 20-cell reduced frequency band so sub-collider ripples do not excite rigid-body torque, but it does not quantize position or fixed-step time. Wave velocity includes `WaveSpeed`, matching the visible phase derivative. `OceanPhysicsSystem` clips each supported convex collider against the local tangent plane of that shared wave, computes the submerged volume and centroid, applies Archimedean buoyancy at the centroid, and applies separate water-relative linear/angular drag. Boxes use their exact six-face volume, spheres use an analytic spherical-cap solution, capsules use a cached convex tessellation, dynamic mesh bodies rebuild the convex-hull topology used by Jolt, and grouped bodies use one cached aggregate compound geometry. Its runtime path culls only bodies certainly above the wave envelope, continues applying buoyancy at every depth, reuses geometry/scratch buffers, and collects center-of-mass/center-of-buoyancy diagnostics only when F9 is enabled. Water forces use the collider's current fixed-step pose rather than a predicted pose. Aggregate linear drag is central because the volume approximation does not provide a center of pressure; only buoyancy at the displaced centroid produces righting torque. Rotational drag is integrated against Jolt's world inverse inertia so it cannot flip angular velocity in one step. At the free surface, effective drag area grows smoothly from zero to the exact fully wetted projection, and quadratic drag uses a stable analytic average. `MapBody` can optionally persist a custom `buoyancy_volume`; absent that value, the collider volume is used. The game passes fixed-step `Engine.Time`; the editor leaves optional simulation time absent so its preview keeps moving. `OceanSettings` persists the physics toggle and all water/player tuning values in `.bth` maps.
 
 Do not implement the wave height again in the underwater shader. The historically sensitive ocean bug was evaluating the wave in two different ways; the surface and waterline test must share the same space convention, time, spectrum, and displacement.
+
+## Spider locomotion and AI
+
+`F3` toggles pursuit; switching pursuit on also enables spider AI after an `F6` pause. `F6` pauses/resumes AI without erasing the chase selection. Switching pursuit off clears the old route and resumes an anchored local patrol. `SpiderPatrol.State` reports `Resting`, `Patrolling`, `Pursuing`, `Navigating`, `Arrived`, `Recovering`, `WaitingForSurface` or `Disabled`, also exposed in the selected-enemy HUD.
+
+Pursuit brakes toward a 1 m stopping radius, with 1 cm numerical tolerance and a separate 1.5 m restart radius. Arrival requires the correct support plane; a nearby player on an elevated platform is not a same-floor arrival. Losing the target clears the arrival latch/route. Brief gait vetoes and turning do not immediately count as navigation failure; sustained lack of progress triggers recovery. Patrol destinations stay within `PatrolRadius` of the spawn or pursuit-exit anchor.
+
+`EnemySystem` publishes one shared target from player feet/support, not the capsule centre. The resolver uses short one-sided probes, original physical normals, sensor/actor filtering and explicit player-body exclusion when an inner body exists. Support updates at 10 Hz, with immediate queries on landing/replacement/large displacement, and retention limited to 0.35 s/1.5 m. Airborne or noclip targets fall back to tangent pursuit on the current physical surface rather than inventing an airborne surface. Player death/unavailability clears the target and disables pursuit; after respawn, enable `F3` again.
+
+The local planner checks a body-and-low-leg corridor and commits to a two-stage detour instead of alternating sides/cutting the obstacle corner. Retries are rate-limited, moving targets/source planes invalidate stale routes, and rejoining casts are limited to 24 m rather than the whole map. Detours retain the source-normal constraint until their exit, preventing accidental climbs at low obstacles. This is bounded local navigation (offsets/exits up to 12 m), not a global navmesh or a guarantee of finding every maze/multilevel route.
+
+`SpiderPatrol` maintains commanded speed independently of the actual motor speed. `SpiderSurfaceMotor` owns collision-checked body movement and publishes both actual velocity and tangent movement intent. `SpiderEnemy` passes these to `ProceduralSpiderWalk` through `SpiderLocomotionPose`; moving-support velocity remains separate from relative locomotion intent.
+
+The procedural gait alternates tetrads `L0/L2/R1/R3` and `L1/L3/R0/R2` (authored indices are zero-based). It allows up to four swing legs, subject to four remaining valid supports and the support polygon. It finishes the active phase before starting the opposite group. Stationary spiders do not cycle their feet unless a turn, invalid contact or recovery requires it.
+
+Landing prediction uses movement intent as well as measured motion so a rejected body move cannot indefinitely shorten recovery steps. Landing selection checks the full IK/collision trajectory for each candidate, with shorter-stride and alternate-lift fallbacks. Swing replanning preserves its lifetime, advances in the same tick, and is rate-limited. A blocked swing can lower onto a verified support; it is never simply declared planted in mid-air. Pending surface confirmation must not be overwritten by a fallback to another face in the same retry.
+
+Locomotion work is bounded by `MaximumShapeQueriesPerUpdate` (512) and `MaximumRaycastsPerUpdate` (192), shared by navigation, motor and gait. `SpiderPatrol` prepares the update even with AI disabled; the motor does not reset a prepared budget. Raycast allowances grow from one third for navigation to two thirds for the motor, then the full cap for gait, preserving essential support probes. Exhaustion rejects/defer speculative work conservatively instead of bypassing collision checks. IK sorts geometric candidates on the stack before invoking native validation, and path planning rejects geometrically impossible arcs before casting. Swept checks cover endpoint poses, so redundant static overlaps are omitted only when a swept check follows. Unchanged valid poses use staggered revalidation.
+
+`SpiderSurfaceSolver` owns reusable filters and a bounded 128-shape cache; dispose it after the motor on death/cleanup. Cache dimensions round outward by at most 0.1 mm. In JoltPhysicsSharp 2.21.0, callback filter constructors and shape-based `BodyCreationSettings` do not set ownership correctly: engine filters explicitly own their handles, and `RigidBody` uses a version-specific ownership shim for the sealed settings wrapper. Revalidate this workaround on package upgrades. Body creation failures must leave `IsBuilt == false`; a spawn rejected by the body limit returns no spider instead of calling native APIs with `BodyID.Invalid`.
+
+The motor still validates current leg poses and swept clearance before accepting body movement. An obsolete future landing is replanned from the accepted body pose instead of vetoing the entire movement. Partial accepted movement does not count as a hard patrol obstruction unless progress is very small. The enemy-selection HUD (`F9`, `F8`, click an enemy) shows actual/intended speed, support/swing/blocked counts, accepted motion fraction and the original full-motion rejection reason.
+
+Regression commands, from the repository root:
+
+```powershell
+dotnet run --project tests/SpiderLocomotion.Tests
+dotnet run --project tests/SpiderLocomotion.Integration -- --case all --max-p95-ms 8 --max-update-ms 50
+dotnet run --project tests/SpiderNativeResources.Tests
+dotnet run --project tests/SpiderTargetSurface.Tests
+dotnet run --project tests/SpiderNavigation.Tests
+dotnet run --project tests/SpiderAi.Integration -- --case all
+```
+
+The first covers pure math/IK without native dependencies. The second imports the real spider FBX and uses Jolt, without OpenGL, to test floor/wall/ceiling locomotion, turns, stopping, blocked-path safety, query caps and timing/allocation metrics per fixed update. Timing thresholds are machine-dependent and are not rendered FPS claims. Its `blocked` case accepts up to 3600 updates for a sustained cost test. The native-resource harness checks filter/settings ownership, disposal, exhausted body capacity, cleanup, reserved query budgets and disabled-AI updates. The additional target/navigation harnesses exercise support selection, retention and committed routes with Jolt; `SpiderAi.Integration` runs actual patrol/planner decisions with the real FBX gait, arrival, F3/F6 API controls, moving/lost targets and low obstacles. They do not synthesize GLFW keypresses or validate rendered appearance, full-map routing, all surface transitions, damage, ragdolls or jumping. See each harness README for requirements and limitations. This gait is a kinematic approximation, not a hemolymph/fluid simulation; death still uses the existing ragdoll.
 
 ## Scene system, maps, and persisted assets
 
@@ -356,7 +391,7 @@ Development shortcuts: backtick opens the console, Insert toggles ImGui, F1 nocl
 
 ## Complete C# file inventory
 
-The tables below were checked against `rg --files -g '*.cs'`. Each C# file appears once.
+The tables below inventory runtime/editor C# files. The standalone regression harnesses under `tests/` are described in the Spider locomotion section.
 
 ### `Blowtorch` project
 

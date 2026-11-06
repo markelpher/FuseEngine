@@ -9,6 +9,7 @@ public sealed class EnemyBodyFilter : BodyFilter
 
     public EnemyBodyFilter(BodyID excludeId)
     {
+        OwnsHandle = true;
         _excludeId = excludeId;
     }
 
@@ -16,6 +17,7 @@ public sealed class EnemyBodyFilter : BodyFilter
         BodyID excludeId,
         System.Collections.Generic.IReadOnlySet<BodyID>? excludedIds)
     {
+        OwnsHandle = true;
         _excludeId = excludeId;
         _excludedIds = excludedIds;
     }
@@ -23,6 +25,7 @@ public sealed class EnemyBodyFilter : BodyFilter
     public EnemyBodyFilter(
         System.Collections.Generic.IReadOnlySet<BodyID> excludedIds)
     {
+        OwnsHandle = true;
         _excludedIds = excludedIds;
     }
 

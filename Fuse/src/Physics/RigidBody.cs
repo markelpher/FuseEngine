@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using JoltPhysicsSharp;
 using Fuse.Core;
 
@@ -64,7 +65,7 @@ public class RigidBody
     }
 
     private Shape? _shape;
-    private BodyID _bodyID;
+    private BodyID _bodyID = BodyID.Invalid;
     private bool _built;
 
     private Vector3 _position;
@@ -423,7 +424,7 @@ public class RigidBody
 
         var motionType = _isKinematic ? MotionType.Kinematic : _mass > 0 ? MotionType.Dynamic : MotionType.Static;
 
-        var settings = new BodyCreationSettings(
+        using var settings = CreateOwnedBodySettings(
             _shape!,
             _position,
             _rotation,
@@ -453,8 +454,28 @@ public class RigidBody
         }
 
         _bodyID = world.CreateAndAddBody(settings);
+        if (!_bodyID.IsValid)
+        {
+            Destroy();
+            Logger.Error($"RigidBody.Build failed to create {_shapeType} body; physics body capacity may be exhausted.");
+            return;
+        }
+
         _built = true;
     }
+
+    private static BodyCreationSettings CreateOwnedBodySettings(
+        Shape shape, Vector3 position, Quaternion rotation, MotionType motionType, ObjectLayer layer)
+    {
+        var settings = new BodyCreationSettings(shape, position, rotation, motionType, layer);
+        SetSettingsOwnership(settings, true);
+        return settings;
+    }
+
+    // JoltPhysicsSharp 2.21.0 leaves ownership off in its shape overloads.
+    // BodyCreationSettings is sealed and its owning overload cannot set a shape.
+    [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "set_OwnsHandle")]
+    private static extern void SetSettingsOwnership(NativeObject settings, bool ownsHandle);
 
     public void Destroy()
     {

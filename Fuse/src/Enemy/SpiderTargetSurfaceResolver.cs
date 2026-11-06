@@ -1,25 +1,66 @@
 using System;
 using System.Numerics;
+using Fuse.Physics;
 using Fuse.Scene;
 using JoltPhysicsSharp;
 
 namespace Fuse.Enemy;
 
 /// <summary>
-/// Resolves the physical surface beneath/around a pursuit target. It does
-/// not build navigation data; it only converts a world target into a stable
-/// collision point and surface normal that the spider planner can pursue.
+/// Resolves local physical support for a pursuit target, not navigation data.
+/// Target positions are feet/support positions, not capsule centres.
 /// </summary>
 public sealed class SpiderTargetSurfaceResolver
 {
     private const float Epsilon = 0.0001f;
-    private const float PreferredNormalWeight = 0.35f;
+    private const float ProbeLift = 0.2f;
+    private const float FootprintRadius = 0.35f;
+    private const float MinimumSupportAlignment = 0.5f;
 
     private readonly SceneManager _scene;
 
     public SpiderTargetSurfaceResolver(SceneManager scene)
     {
         _scene = scene ?? throw new ArgumentNullException(nameof(scene));
+    }
+
+    public bool TryResolvePlayer(
+        Vector3 feetPosition,
+        CharacterVirtual character,
+        float searchDistance,
+        out SpiderTargetSurface surface)
+    {
+        surface = default;
+        if (!IsFinite(feetPosition) || !float.IsFinite(searchDistance) || searchDistance <= 0f)
+            return false;
+
+        Vector3 up = NormalizeOrZero(character.Up);
+        if (up == Vector3.Zero)
+            up = Vector3.UnitY;
+
+        // CharacterVirtual has no queryable body unless InnerBodyShape was set.
+        BodyID? excludedBody = character.InnerBodyID.IsValid ? character.InnerBodyID : null;
+        Vector3 supportPosition = character.GroundPosition;
+        Vector3 supportOffset = supportPosition - feetPosition;
+        if (character.GroundState == GroundState.OnGround &&
+            IsFinite(supportPosition) &&
+            supportOffset.LengthSquared() <= 0.75f * 0.75f &&
+            MathF.Abs(Vector3.Dot(supportOffset, up)) <= 0.5f &&
+            Vector3.Dot(NormalizeOrZero(character.GroundNormal), up) >= MinimumSupportAlignment)
+        {
+            // On a curb the capsule's actual contact can be beside and above
+            // its lowest point. Re-query that contact: native ground data can
+            // be stale after teleportation or refer to a trigger/actor.
+            if (TryProbe(supportPosition, up, 0.1f, excludedBody, out var support) &&
+                Vector3.DistanceSquared(support.Point, supportPosition) <= 0.08f * 0.08f)
+            {
+                surface = new SpiderTargetSurface(true, support.Point, support.Normal,
+                    support.BodyId, Vector3.Distance(support.Point, feetPosition));
+                return true;
+            }
+        }
+
+        return TryResolve(feetPosition, up, searchDistance, out surface, excludedBody);
     }
 
     public bool TryResolve(
@@ -30,149 +71,107 @@ public sealed class SpiderTargetSurfaceResolver
         BodyID? excludedBody = null)
     {
         surface = default;
-        if (!IsFinite(targetPosition))
+        if (!IsFinite(targetPosition) || !float.IsFinite(searchDistance) || searchDistance <= 0f)
             return false;
 
-        searchDistance = MathF.Max(0.5f, searchDistance);
-        preferredNormal = NormalizeOrZero(preferredNormal);
+        Vector3 up = NormalizeOrZero(preferredNormal);
+        if (up == Vector3.Zero)
+            up = Vector3.UnitY;
 
-        Vector3[] directions = BuildProbeDirections(
-            preferredNormal,
-            targetPosition);
-        float halfDistance = searchDistance * 0.5f;
-        float bestScore = float.MaxValue;
+        // Always prefer support directly under the feet. Symmetric rays from
+        // +/- half the search distance can enter the opposite face of a wall,
+        // ceiling or capsule; SceneManager also flips normals against the ray.
+        if (TryProbe(targetPosition, up, searchDistance, excludedBody, out surface))
+            return true;
 
-        foreach (Vector3 direction in directions)
+        Vector3 reference = MathF.Abs(up.X) < 0.8f ? Vector3.UnitX : Vector3.UnitZ;
+        Vector3 forward = Vector3.Normalize(Vector3.Cross(up, reference));
+        Vector3 right = Vector3.Cross(forward, up);
+        ReadOnlySpan<Vector3> offsets = stackalloc Vector3[]
         {
-            Vector3 origin = targetPosition - direction * halfDistance;
-            if (!_scene.Raycast(
-                    origin,
-                    direction,
-                    searchDistance,
-                    out SceneRaycastHit hit,
-                    excludedBody,
-                    collideWithBackFaces: true, walkableOnly: true))
-            {
-                continue;
-            }
+            forward * FootprintRadius, -forward * FootprintRadius,
+            right * FootprintRadius, -right * FootprintRadius
+        };
 
-            Vector3 normal = NormalizeOrZero(hit.Normal);
-            if (normal.LengthSquared() <= Epsilon * Epsilon ||
-                Vector3.Dot(normal, -direction) < 0.05f)
-            {
-                continue;
-            }
-
-            float targetDistance = Vector3.Distance(hit.Position, targetPosition);
-            float normalPenalty = preferredNormal.LengthSquared() > Epsilon * Epsilon
-                ? 1f - MathF.Max(-1f, Vector3.Dot(normal, preferredNormal))
-                : 0f;
-            float score = targetDistance + normalPenalty * PreferredNormalWeight;
-            if (!float.IsFinite(score) || score >= bestScore)
+        float bestDistance = float.MaxValue;
+        foreach (Vector3 offset in offsets)
+        {
+            if (!TryProbe(targetPosition + offset, up, searchDistance, excludedBody, out var candidate))
                 continue;
 
-            bestScore = score;
-            surface = new SpiderTargetSurface(
-                true,
-                hit.Position,
-                normal,
-                hit.BodyID,
-                targetDistance);
+            float distance = Vector3.Distance(candidate.Point, targetPosition);
+            if (distance >= bestDistance)
+                continue;
+
+            bestDistance = distance;
+            surface = new SpiderTargetSurface(true, candidate.Point, candidate.Normal,
+                candidate.BodyId, distance);
         }
 
         return surface.IsValid;
     }
 
-    private static Vector3[] BuildProbeDirections(
-        Vector3 preferredNormal,
-        Vector3 targetPosition)
+    private bool TryProbe(
+        Vector3 feetPosition,
+        Vector3 up,
+        float searchDistance,
+        BodyID? excludedBody,
+        out SpiderTargetSurface surface)
     {
-        if (preferredNormal.LengthSquared() > Epsilon * Epsilon &&
-            BuildTangentBasis(
-                preferredNormal,
-                Vector3.Zero,
-                out Vector3 forward,
-                out Vector3 right))
+        surface = default;
+        Vector3 origin = feetPosition + up * ProbeLift;
+        float length = searchDistance + ProbeLift;
+        Vector3 direction = -up * length;
+        var ray = new Ray(in origin, in direction);
+        var settings = new RayCastSettings
         {
-            return new[]
-            {
-                -preferredNormal,
-                preferredNormal,
-                forward,
-                -forward,
-                right,
-                -right,
-                NormalizeOrFallback(-preferredNormal + forward, -preferredNormal),
-                NormalizeOrFallback(-preferredNormal - forward, -preferredNormal),
-                NormalizeOrFallback(-preferredNormal + right, -preferredNormal),
-                NormalizeOrFallback(-preferredNormal - right, -preferredNormal)
-            };
-        }
-
-        // The player currently has no arbitrary-surface locomotion normal.
-        // This fallback samples a symmetric frame around the target until a
-        // real collision normal is found; the spider itself never branches on
-        // a global axis.
-        return new[]
-        {
-            Vector3.UnitY,
-            -Vector3.UnitY,
-            Vector3.UnitX,
-            -Vector3.UnitX,
-            Vector3.UnitZ,
-            -Vector3.UnitZ
+            BackFaceModeTriangles = BackFaceMode.IgnoreBackFaces,
+            BackFaceModeConvex = BackFaceMode.IgnoreBackFaces,
+            TreatConvexAsSolid = true
         };
-    }
-
-    private static bool BuildTangentBasis(
-        Vector3 normal,
-        Vector3 preferredForward,
-        out Vector3 forward,
-        out Vector3 right)
-    {
-        normal = NormalizeOrZero(normal);
-        forward = NormalizeOrZero(
-            ProjectOnPlane(preferredForward, normal));
-        if (forward.LengthSquared() <= Epsilon * Epsilon)
-            forward = BuildFallbackTangent(normal);
-
-        right = NormalizeOrZero(Vector3.Cross(forward, normal));
-        forward = NormalizeOrZero(Vector3.Cross(normal, right));
-        return forward.LengthSquared() > Epsilon * Epsilon &&
-               right.LengthSquared() > Epsilon * Epsilon;
-    }
-
-    private static Vector3 BuildFallbackTangent(Vector3 normal)
-    {
-        Vector3 reference = Vector3.UnitX;
-        float smallestAlignment = MathF.Abs(Vector3.Dot(normal, reference));
-        Vector3[] candidates = { Vector3.UnitY, Vector3.UnitZ };
-        foreach (Vector3 candidate in candidates)
+        using var broadPhase = new DefaultBroadPhaseLayerFilter();
+        using var objectLayer = new DefaultObjectLayerFilter();
+        using var bodies = new SurfaceBodyFilter(excludedBody, null, _scene.NonWalkableBodies);
+        using var shapes = new DefaultShapeFilter();
+        var hits = new List<RayCastResult>(1);
+        if (!_scene.Physics.NarrowPhaseQuery.CastRay(ray, settings,
+                CollisionCollectorType.ClosestHit, hits, broadPhase, objectLayer, bodies, shapes) ||
+            hits.Count == 0)
         {
-            float alignment = MathF.Abs(Vector3.Dot(normal, candidate));
-            if (alignment >= smallestAlignment)
-                continue;
-
-            reference = candidate;
-            smallestAlignment = alignment;
+            return false;
         }
 
-        return NormalizeOrZero(Vector3.Cross(normal, reference));
-    }
+        RayCastResult hit = hits[0];
+        if (!hit.BodyID.IsValid || !float.IsFinite(hit.Fraction) || hit.Fraction * length <= Epsilon)
+            return false;
 
-    private static Vector3 ProjectOnPlane(Vector3 value, Vector3 normal) =>
-        value - normal * Vector3.Dot(value, normal);
+        Vector3 point = origin + direction * hit.Fraction;
+        Vector3 normal;
+        var locks = _scene.Physics.BodyLockInterface;
+        locks.LockRead(hit.BodyID, out BodyLockRead readLock);
+        if (!readLock.Succeeded)
+            return false;
+        try
+        {
+            if (readLock.Body is not { } body)
+                return false;
+            var subShape = new SubShapeID(hit.subShapeID2);
+            // SceneManager.Raycast flips this normal to face the ray. Support
+            // needs the original normal, otherwise an underside looks valid.
+            normal = NormalizeOrZero(body.GetWorldSpaceSurfaceNormal(in subShape, in point));
+        }
+        finally { locks.UnlockRead(readLock); }
 
-    private static Vector3 NormalizeOrFallback(Vector3 value, Vector3 fallback)
-    {
-        Vector3 normalized = NormalizeOrZero(value);
-        return normalized.LengthSquared() > Epsilon * Epsilon
-            ? normalized
-            : NormalizeOrZero(fallback);
+        if (!IsFinite(point) || Vector3.Dot(normal, up) < MinimumSupportAlignment)
+            return false;
+
+        surface = new SpiderTargetSurface(true, point, normal, hit.BodyID,
+            Vector3.Distance(point, feetPosition));
+        return true;
     }
 
     private static Vector3 NormalizeOrZero(Vector3 value) =>
-        value.LengthSquared() > Epsilon * Epsilon
+        IsFinite(value) && float.IsFinite(value.LengthSquared()) && value.LengthSquared() > Epsilon * Epsilon
             ? Vector3.Normalize(value)
             : Vector3.Zero;
 

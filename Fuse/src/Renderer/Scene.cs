@@ -999,13 +999,26 @@ public class Scene
         return entity?.Body?.IsTrigger ?? false;
     }
 
+    public void UnregisterBody(Entity entity)
+    {
+        if (entity.Body is { IsBuilt: true } body &&
+            _bodyEntityMap.TryGetValue(body.Native, out Entity? registered) &&
+            ReferenceEquals(registered, entity))
+        {
+            _bodyEntityMap.Remove(body.Native);
+            return;
+        }
+
+        // Death/cleanup may already have invalidated the RigidBody wrapper.
+        foreach (var entry in _bodyEntityMap.Where(entry => ReferenceEquals(entry.Value, entity)).ToArray())
+            _bodyEntityMap.Remove(entry.Key);
+    }
+
     public void Remove(Entity entity)
     {
         if (entity == null) return;
 
-        if (entity.Body != null && entity.Body.IsBuilt)
-            _bodyEntityMap.Remove(entity.Body.Native);
-
+        UnregisterBody(entity);
         _entities.Remove(entity);
     }
 }

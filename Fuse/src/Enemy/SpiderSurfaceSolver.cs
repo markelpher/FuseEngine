@@ -13,7 +13,7 @@ namespace Fuse.Enemy;
 /// A contact is deliberately more than a raycast hit: it keeps the supporting
 /// body/local anchor, a filtered normal and a confidence value.
 /// </summary>
-public sealed class SpiderSurfaceSolver : IGizmoDrawable
+public sealed class SpiderSurfaceSolver : IGizmoDrawable, IDisposable
 {
     private const float Epsilon = 0.0001f;
     private const float BodyProbeRadius = 0.48f;
@@ -23,6 +23,8 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     private const float SameSurfaceObstacleProbeMaximum = 3.50f;
     private const float SameSurfaceDetourMargin = 0.30f;
     private const float SameSurfaceDetourMaximumOffset = 12.0f;
+    private const int SameSurfaceSearchShapeBudget = 96;
+    private const int SameSurfaceSearchRayBudget = 24;
 
     private readonly SceneManager _scene;
     private readonly SpiderLocomotionProfile _profile;
@@ -32,6 +34,22 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     private readonly List<SpiderSurfaceContact> _debugCandidates = new();
     private readonly HashSet<BodyID> _ignoredBodies = new();
     private SpiderSurfaceContact _lastBodyContact;
+    private readonly DefaultBroadPhaseLayerFilter _queryBroadPhase = new();
+    private readonly DefaultObjectLayerFilter _queryObjectLayer = new();
+    private readonly DefaultShapeFilter _queryShapeFilter = new();
+    private SurfaceBodyFilter? _queryBodyFilter;
+    private BodyID _querySelf = BodyID.Invalid;
+    private readonly Dictionary<(int Length, int Radius), Shape> _segmentShapes = new();
+    private readonly Queue<(int Length, int Radius)> _shapeOrder = new();
+    private int _shapeQueryLimit;
+    private int _raycastLimit;
+    private bool _disposed;
+
+    public int FrameShapeQueries { get; private set; }
+    public int FrameRaycasts { get; private set; }
+    public bool QueryBudgetExhausted { get; private set; }
+    public bool HasShapeQueryBudget => !_disposed && FrameShapeQueries < _shapeQueryLimit;
+    public bool HasRaycastBudget => !_disposed && FrameRaycasts < _raycastLimit;
 
     public SpiderSurfaceContact LastBodyContact => _lastBodyContact;
     public BodyFilter CreateBodyFilter(BodyID self) =>
@@ -42,6 +60,7 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     {
         _scene = scene;
         _profile = profile ?? SpiderLocomotionProfile.Default;
+        BeginFrame();
         Debug.DebugDrawer.Register(this);
     }
 
@@ -69,11 +88,62 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     {
         _debugProbes.Clear();
         _debugCandidates.Clear();
+        FrameShapeQueries = FrameRaycasts = 0;
+        QueryBudgetExhausted = false;
+        // Reserve most of the update for the gait that can free a blocked body.
+        _shapeQueryLimit = System.Math.Max(1, _profile.MaximumShapeQueriesPerUpdate / 3);
+        _raycastLimit = System.Math.Max(1, _profile.MaximumRaycastsPerUpdate / 3);
+    }
+
+    public void BeginMotor()
+    {
+        // Pursuit may exhaust its probe allowance; it must not steal the
+        // motor's essential support acquisition/post-move confirmation rays.
+        _raycastLimit = System.Math.Max(1, _profile.MaximumRaycastsPerUpdate * 2 / 3);
+    }
+
+    public void BeginGait()
+    {
+        _shapeQueryLimit = System.Math.Max(1, _profile.MaximumShapeQueriesPerUpdate);
+        _raycastLimit = System.Math.Max(1, _profile.MaximumRaycastsPerUpdate);
+    }
+
+    private bool TakeShapeQuery()
+    {
+        if (_disposed || FrameShapeQueries >= _shapeQueryLimit)
+        {
+            QueryBudgetExhausted = true;
+            return false;
+        }
+        FrameShapeQueries++;
+        return true;
+    }
+
+    private bool TakeRaycast()
+    {
+        if (_disposed || FrameRaycasts >= _raycastLimit)
+        {
+            QueryBudgetExhausted = true;
+            return false;
+        }
+        FrameRaycasts++;
+        return true;
+    }
+
+    private SurfaceBodyFilter QueryBodyFilter(BodyID self)
+    {
+        if (_queryBodyFilter == null || _querySelf != self)
+        {
+            _queryBodyFilter?.Dispose();
+            _querySelf = self;
+            _queryBodyFilter = new SurfaceBodyFilter(self, _ignoredBodies, _scene.NonWalkableBodies);
+        }
+        return _queryBodyFilter;
     }
 
     public SpiderSurfaceContact Refresh(in SpiderSurfaceContact contact)
     {
-        if (!contact.IsValid || !contact.BodyId.IsValid ||
+        if (_disposed || !contact.IsValid || !contact.BodyId.IsValid ||
             (contact.SupportBody != null && (!contact.SupportBody.IsBuilt || contact.SupportBody.Native != contact.BodyId)))
             return default;
         _scene.Physics.BodyLockInterface.LockRead(contact.BodyId, out BodyLockRead readLock);
@@ -251,9 +321,9 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     /// <summary>
     /// Finds a short lateral waypoint when an obstacle blocks a spider that is
     /// otherwise pursuing a target on the same support surface. This is a
-    /// reactive local query, not a navigation graph: it probes the two tangent
-    /// sides, validates that the body can keep its support, and prefers a side
-    /// that restores a clear line to the target sooner.
+    /// bounded local query, not a navigation graph: it tries a small set of
+    /// tangent-side offsets and exits up to 12 m away, checks feet/body space,
+    /// and samples support. Only complete routes with a clear exit are accepted.
     /// </summary>
     public bool TryFindSameSurfaceDetour(
         Vector3 bodyCenter,
@@ -267,9 +337,28 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         out float score,
         out Vector3 selectedSide)
     {
-        waypoint = Vector3.Zero;
+        return TryFindSameSurfaceDetour(bodyCenter, currentNormal, desiredDirection,
+            targetPosition, clearance, selfBody, preferredSide, out waypoint,
+            out score, out selectedSide, out _);
+    }
+
+    // The second waypoint keeps the route outside the obstacle until a checked
+    // reconnect is available, rather than cutting back across its near corner.
+    internal bool TryFindSameSurfaceDetour(
+        Vector3 bodyCenter,
+        Vector3 currentNormal,
+        Vector3 desiredDirection,
+        Vector3 targetPosition,
+        float clearance,
+        BodyID selfBody,
+        Vector3 preferredSide,
+        out Vector3 waypoint,
+        out float score,
+        out Vector3 selectedSide,
+        out Vector3 exitWaypoint)
+    {
+        waypoint = exitWaypoint = selectedSide = Vector3.Zero;
         score = float.MaxValue;
-        selectedSide = Vector3.Zero;
 
         currentNormal = NormalizeOrZero(currentNormal);
         desiredDirection = NormalizeOrZero(
@@ -289,155 +378,82 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
             return false;
         }
 
-        clearance = MathF.Max(0.01f, clearance);
-        float bodyRadius = System.Math.Clamp(
-            MathF.Max(BodyProbeRadius, clearance * 0.72f),
-            0.30f,
-            0.75f);
-        float probeDistance = System.Math.Clamp(
-            clearance * 3.0f,
-            SameSurfaceObstacleProbeMinimum,
-            SameSurfaceObstacleProbeMaximum);
-
-        // Establish the current support before probing the obstacle. The
-        // candidate support checks below use this same local surface frame.
-        if (!TryFindSupportContact(
-                bodyCenter,
-                currentNormal,
-                forward,
-                clearance,
-                selfBody,
-                out _))
-        {
+        if (!float.IsFinite(clearance) || clearance <= 0f)
             return false;
-        }
 
-        Vector3 probeOrigin = bodyCenter + currentNormal * 0.18f;
-        if (!TryProbeContact(
-                probeOrigin,
-                forward,
-                probeDistance,
-                selfBody,
-                out SpiderSurfaceContact obstacle,
-                out float obstacleDistance))
-        {
+        float probeDistance = System.Math.Clamp(clearance * 4f,
+            SameSurfaceObstacleProbeMinimum, SameSurfaceObstacleProbeMaximum);
+        Vector3 targetDelta = ProjectOnPlane(targetPosition - bodyCenter, currentNormal);
+        float targetDistance = targetDelta.Length();
+        if (!float.IsFinite(targetDistance) || targetDistance <= Epsilon || IsSameSurfacePathClear(bodyCenter,
+                targetPosition, currentNormal, clearance, selfBody, probeDistance))
             return false;
-        }
 
-        Vector3 obstacleNormal = NormalizeOrZero(obstacle.Normal);
-        if (obstacleNormal.LengthSquared() <= Epsilon * Epsilon ||
-            !float.IsFinite(obstacleDistance))
-        {
+        int shapeLimit = System.Math.Min(_shapeQueryLimit,
+            FrameShapeQueries + SameSurfaceSearchShapeBudget);
+        int rayLimit = System.Math.Min(_raycastLimit,
+            FrameRaycasts + SameSurfaceSearchRayBudget);
+        if (FrameShapeQueries + 8 > shapeLimit || FrameRaycasts + 7 > rayLimit)
             return false;
-        }
+        if (!TryProbeContact(bodyCenter + currentNormal * 0.18f, -currentNormal,
+                clearance + 0.30f, selfBody, out SpiderSurfaceContact support, out _) ||
+            Vector3.Dot(support.Normal, currentNormal) < 0.92f)
+            return false;
 
-        float minimumOffset = bodyRadius + SameSurfaceDetourMargin;
-        float[] lateralOffsets =
+        // The target is a body centre, possibly at raw player height. Keep all
+        // three route legs on the physical source plane.
+        // This is local steering, not a cast across the entire map to a
+        // distant player. Reassess the remaining route after the local exit.
+        Vector3 reconnect = bodyCenter + targetDelta * MathF.Min(1f, 24f / targetDistance);
+        preferredSide = NormalizeOrZero(ProjectOnPlane(preferredSide, currentNormal));
+        bool committedSide = preferredSide.LengthSquared() > Epsilon * Epsilon;
+        float minimumOffset = SameSurfaceLegHalfWidth(clearance) + SameSurfaceDetourMargin;
+        ReadOnlySpan<float> offsets = [minimumOffset, minimumOffset * 1.5f,
+            minimumOffset * 2.5f, SameSurfaceDetourMaximumOffset];
+        ReadOnlySpan<float> advances = [probeDistance + minimumOffset,
+            8f, SameSurfaceDetourMaximumOffset];
+
+        // First complete route on a committed side wins. Never return a merely
+        // lateral escape that still points straight back into the obstacle.
+        for (int sideIndex = 0; sideIndex < (committedSide ? 1 : 2); sideIndex++)
         {
-            minimumOffset,
-            MathF.Min(SameSurfaceDetourMaximumOffset, minimumOffset * 2.0f),
-            MathF.Min(SameSurfaceDetourMaximumOffset, minimumOffset * 4.0f),
-            MathF.Min(SameSurfaceDetourMaximumOffset, minimumOffset * 8.0f),
-            SameSurfaceDetourMaximumOffset
-        };
-
-        preferredSide = NormalizeOrZero(
-            ProjectOnPlane(preferredSide, currentNormal));
-        bool hasPreferredSide =
-            preferredSide.LengthSquared() > Epsilon * Epsilon;
-        Vector3[] sideDirections = hasPreferredSide
-            ? new[] { preferredSide, -preferredSide }
-            : new[] { right, -right };
-        Vector3 targetDelta = ProjectOnPlane(
-            targetPosition - bodyCenter,
-            currentNormal);
-        Vector3 targetDirection = NormalizeOrZero(targetDelta);
-        if (targetDirection.LengthSquared() <= Epsilon * Epsilon)
-            targetDirection = forward;
-
-        for (int sideIndex = 0; sideIndex < sideDirections.Length; sideIndex++)
-        {
-            Vector3 side = sideDirections[sideIndex];
-            for (int offsetIndex = 0; offsetIndex < lateralOffsets.Length; offsetIndex++)
+            Vector3 side = committedSide ? preferredSide : (sideIndex == 0 ? right : -right);
+            foreach (float offset in offsets)
             {
-                float lateralOffset = lateralOffsets[offsetIndex];
-                Vector3 candidate = bodyCenter + side * lateralOffset;
+                float lateral = MathF.Min(offset, SameSurfaceDetourMaximumOffset);
+                Vector3 candidate = bodyCenter + side * lateral;
+                if (FrameShapeQueries + 2 > shapeLimit || FrameRaycasts + 6 > rayLimit)
+                    return false;
+                if (!IsSameSurfacePathClear(bodyCenter, candidate, currentNormal, clearance, selfBody))
+                    continue;
 
-                if (!TryFindSupportContact(
-                        candidate,
-                        currentNormal,
-                        forward,
-                        clearance,
-                        selfBody,
-                        out SpiderSurfaceContact candidateSupport))
+                foreach (float advance in advances)
                 {
-                    continue;
+                    if (FrameShapeQueries + 6 > shapeLimit || FrameRaycasts + 6 > rayLimit)
+                        return false;
+                    Vector3 exit = candidate + forward * MathF.Min(advance, targetDistance);
+                    // A clear cross-section back to the pursuit axis proves
+                    // this exit has passed the blocking footprint. Merely
+                    // finding a clear diagonal can release the route too soon.
+                    Vector3 axisExit = bodyCenter + forward * MathF.Min(advance, targetDistance);
+                    if (!IsSameSurfacePathClear(candidate, exit, currentNormal, clearance, selfBody) ||
+                        !IsSameSurfacePathClear(exit, axisExit, currentNormal, clearance, selfBody) ||
+                        !IsSameSurfacePathClear(exit, reconnect, currentNormal, clearance, selfBody))
+                        continue;
+                    if (!HasSameSurfaceRouteSupport(bodyCenter, candidate, support, currentNormal, clearance, selfBody) ||
+                        !HasSameSurfaceRouteSupport(candidate, exit, support, currentNormal, clearance, selfBody) ||
+                        !HasSameSurfaceRouteSupport(exit, reconnect, support, currentNormal, clearance, selfBody))
+                        continue;
+
+                    waypoint = candidate;
+                    exitWaypoint = exit;
+                    selectedSide = side;
+                    score = lateral + Vector3.Distance(candidate, exit) + Vector3.Distance(exit, reconnect);
+                    return true;
                 }
-
-                float supportAlignment = Vector3.Dot(
-                    NormalizeOrZero(candidateSupport.Normal),
-                    currentNormal);
-                if (supportAlignment < 0.72f)
-                    continue;
-
-                if (!IsSameSurfaceDetourPathClear(
-                        bodyCenter,
-                        candidate,
-                        currentNormal,
-                        bodyRadius,
-                        selfBody))
-                {
-                    continue;
-                }
-
-                Vector3 toTarget = ProjectOnPlane(
-                    targetPosition - candidate,
-                    currentNormal);
-                float targetDistance = toTarget.Length();
-                if (!float.IsFinite(targetDistance))
-                    continue;
-
-                bool lineToTargetClear = IsSameSurfaceDetourPathClear(
-                    candidate,
-                    targetPosition,
-                    currentNormal,
-                    bodyRadius,
-                    selfBody,
-                    maxDistance: MathF.Max(0.5f, targetDistance));
-
-                // A clear line after this waypoint is worth more than a small
-                // difference in lateral distance. The tiny side bias makes a
-                // tie deterministic and, together with the planner's
-                // persistent waypoint, prevents left/right oscillation.
-                float candidateScore = targetDistance +
-                                       lateralOffset * 0.24f +
-                                       (1f - supportAlignment) * 0.75f +
-                                       offsetIndex * 0.04f +
-                                       sideIndex * 0.005f;
-                if (hasPreferredSide &&
-                    Vector3.Dot(side, preferredSide) < 0.5f)
-                {
-                    // Keep following the side selected on the previous
-                    // waypoint. The opposite side is still available when
-                    // the preferred side has no valid support/path.
-                    candidateScore += 0.65f;
-                }
-                if (lineToTargetClear)
-                    candidateScore -= 3.0f;
-                else
-                    candidateScore += 0.85f;
-
-                if (candidateScore >= score)
-                    continue;
-
-                score = candidateScore;
-                waypoint = candidate;
-                selectedSide = side;
             }
         }
-
-        return waypoint.LengthSquared() > Epsilon * Epsilon &&
-               float.IsFinite(score);
+        return false;
     }
 
     /// <summary>
@@ -676,17 +692,15 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     /// <summary>Overlap and swept capsule queries used by the complete IK chain.</summary>
     public bool IsSegmentClear(Vector3 a, Vector3 b, float radius, BodyID selfBody, float skin = 0.004f)
     {
-        using Shape shape = SegmentShape(a, b, radius, out Matrix4x4 transform);
-        using var bp = new DefaultBroadPhaseLayerFilter();
-        using var ol = new DefaultObjectLayerFilter();
-        using var bodies = CreateBodyFilter(selfBody);
-        using var shapes = new DefaultShapeFilter();
+        if (!TakeShapeQuery()) return false;
+        Shape shape = SegmentShape(a, b, radius, out Matrix4x4 transform);
+        var bodies = QueryBodyFilter(selfBody);
         Vector3 scale = Vector3.One, offset = Vector3.Zero;
         transform = Matrix4x4.Transpose(transform);
         _overlapHits.Clear();
         var settings = new CollideShapeSettings { BackFaceMode = BackFaceMode.CollideWithBackFaces };
         _scene.Physics.NarrowPhaseQuery.CollideShape(shape, in scale, in transform, in settings, in offset,
-            CollisionCollectorType.AllHit, _overlapHits, bp, ol, bodies, shapes);
+            CollisionCollectorType.AllHit, _overlapHits, _queryBroadPhase, _queryObjectLayer, bodies, _queryShapeFilter);
         foreach (var hit in _overlapHits)
             if (hit.PenetrationDepth > skin) return false;
         return true;
@@ -699,7 +713,12 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         // A translated capsule inflated by the non-translational endpoint
         // motion contains the entire linearly swept rotating segment.
         float expansion = MathF.Max((nextA - a - translation).Length(), (nextB - b - translation).Length());
-        using Shape shape = SegmentShape(a, b, radius + expansion, out Matrix4x4 transform);
+        if (_disposed || FrameShapeQueries >= _shapeQueryLimit)
+                {
+                    QueryBudgetExhausted = true;
+                    return false;
+                }
+                Shape shape = SegmentShape(a, b, radius + expansion, out Matrix4x4 transform);
         return ShapeTravelFraction(shape, transform, translation, selfBody, skin, hit =>
         {
             // Inflation bounds the rotating capsule, but can overlap a floor
@@ -725,10 +744,8 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
     public float ShapeTravelFraction(Shape shape, Matrix4x4 transform, Vector3 displacement,
         BodyID selfBody, float skin = 0.004f, Func<ShapeCastResult, bool>? separatedFromHit = null)
     {
-        using var bp = new DefaultBroadPhaseLayerFilter();
-        using var ol = new DefaultObjectLayerFilter();
-        using var bodies = CreateBodyFilter(selfBody);
-        using var shapes = new DefaultShapeFilter();
+        if (!TakeShapeQuery()) return 0f;
+        var bodies = QueryBodyFilter(selfBody);
         Vector3 baseOffset = Vector3.Zero;
         // JoltPhysicsSharp's shape-query ABI consumes column-major transforms.
         // Passing System.Numerics translation in M41 casts at the origin.
@@ -741,7 +758,7 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
             ReturnDeepestPoint = true
         };
         _scene.Physics.NarrowPhaseQuery.CastShape(shape, in transform, in displacement, settings, in baseOffset,
-            CollisionCollectorType.AllHit, _castHits, bp, ol, bodies, shapes);
+            CollisionCollectorType.AllHit, _castHits, _queryBroadPhase, _queryObjectLayer, bodies, _queryShapeFilter);
         float fraction = 1f;
         foreach (var hit in _castHits)
         {
@@ -755,14 +772,40 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         return fraction;
     }
 
-    private static Shape SegmentShape(Vector3 a, Vector3 b, float radius, out Matrix4x4 transform)
+    private Shape SegmentShape(Vector3 a, Vector3 b, float radius, out Matrix4x4 transform)
     {
         Vector3 delta = b - a;
         float length = delta.Length();
         Quaternion rotation = Animation.SpiderLocomotionMath.RotationBetween(Vector3.UnitY, delta, Vector3.UnitX);
         transform = Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation((a + b) * 0.5f);
-        return length < 0.0001f ? new SphereShape(MathF.Max(radius, 0.001f)) :
-            new CapsuleShape(length * 0.5f, MathF.Max(radius, 0.001f));
+        // Round outward by at most 0.1 mm: cached shapes conservatively contain
+        // the requested segment while avoiding native allocation per IK trial.
+        var key = (Length: (int)MathF.Ceiling(length * 10000f), Radius: (int)MathF.Ceiling(MathF.Max(radius, 0.001f) * 10000f));
+        if (_segmentShapes.TryGetValue(key, out Shape? shape)) return shape;
+        if (_segmentShapes.Count >= 128)
+        {
+            var oldest = _shapeOrder.Dequeue();
+            _segmentShapes[oldest].Dispose();
+            _segmentShapes.Remove(oldest);
+        }
+        shape = key.Length == 0 ? new SphereShape(key.Radius / 10000f) :
+            new CapsuleShape(key.Length / 20000f, key.Radius / 10000f);
+        _segmentShapes.Add(key, shape);
+        _shapeOrder.Enqueue(key);
+        return shape;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _queryBodyFilter?.Dispose();
+        _queryShapeFilter.Dispose();
+        _queryBroadPhase.Dispose();
+        _queryObjectLayer.Dispose();
+        foreach (Shape shape in _segmentShapes.Values) shape.Dispose();
+        _segmentShapes.Clear();
+        _shapeOrder.Clear();
     }
 
     public bool IsFootStepPathClear(Vector3 start, Vector3 end, Vector3 startNormal, Vector3 endNormal,
@@ -794,7 +837,7 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         ReadOnlySpan<Vector3> offsets = [x * radius, -x * radius, z * radius, -z * radius];
         foreach (Vector3 offset in offsets)
         {
-            if (!_scene.Raycast(contact.Point + offset + contact.Normal * (radius + 0.04f), -contact.Normal,
+            if (!TakeRaycast() || !_scene.Raycast(contact.Point + offset + contact.Normal * (radius + 0.04f), -contact.Normal,
                     radius + 0.08f, out var hit, selfBody, true, _ignoredBodies, walkableOnly: true) ||
                 hit.BodyID != contact.BodyId || Vector3.Dot(hit.Normal, contact.Normal) < _profile.ContactPatchNormalAlignment)
                 return false;
@@ -802,70 +845,88 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         return true;
     }
 
-    private bool IsSameSurfaceDetourPathClear(
+    /// <summary>
+    /// Checks a tangent corridor from a body centre: the physical capsule and
+    /// a conservative feet/leg band above the expected support plane. Costs at
+    /// most two shape queries and no rays; false also means invalid input or
+    /// insufficient budget. This does not prove continuous floor support.
+    /// </summary>
+    public bool IsSameSurfacePathClear(
         Vector3 start,
         Vector3 end,
         Vector3 surfaceNormal,
-        float bodyRadius,
+        float clearance,
         BodyID selfBody,
         float maxDistance = float.MaxValue)
     {
+        if (_disposed || !IsFinite(start) || !IsFinite(end) ||
+            !IsFinite(surfaceNormal) || !float.IsFinite(clearance) || clearance <= 0f ||
+            !float.IsFinite(maxDistance) || maxDistance <= 0f)
+            return false;
         surfaceNormal = NormalizeOrZero(surfaceNormal);
+        if (surfaceNormal.LengthSquared() <= Epsilon * Epsilon)
+            return false;
         Vector3 path = ProjectOnPlane(end - start, surfaceNormal);
         float pathLength = path.Length();
-        if (surfaceNormal.LengthSquared() <= Epsilon * Epsilon ||
-            pathLength <= Epsilon ||
-            !float.IsFinite(pathLength))
+        if (!float.IsFinite(pathLength)) return false;
+        if (pathLength <= Epsilon) return true;
+        if (FrameShapeQueries + 2 > _shapeQueryLimit)
         {
-            return true;
-        }
-
-        pathLength = MathF.Min(pathLength, MathF.Max(0.01f, maxDistance));
-        Vector3 direction = Vector3.Normalize(path);
-        Vector3 width = NormalizeOrZero(Vector3.Cross(direction, surfaceNormal));
-        if (width.LengthSquared() <= Epsilon * Epsilon)
-            return false;
-
-        float laneOffset = MathF.Max(0.12f, bodyRadius * 0.82f);
-        using (var capsule = new CapsuleShape(_profile.BodyCylinderHeight * 0.5f, bodyRadius))
-        {
-            Quaternion rotation = Animation.SpiderLocomotionMath.RotationBetween(Vector3.UnitY, surfaceNormal, direction);
-            Matrix4x4 transform = Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(start);
-            if (ShapeTravelFraction(capsule, transform, direction * pathLength, selfBody) < 1f) return false;
-        }
-        float[] lanes = { -laneOffset, 0f, laneOffset };
-        foreach (float lane in lanes)
-        {
-            Vector3 laneStart = start + surfaceNormal * 0.18f + width * lane;
-            Vector3 laneEnd = laneStart + direction * pathLength;
-            if (!_scene.Raycast(
-                    laneStart,
-                    direction,
-                    pathLength,
-                    out SceneRaycastHit hit,
-                    selfBody,
-                    collideWithBackFaces: true,
-                    excludedBodies: _ignoredBodies, walkableOnly: true))
-            {
-                _debugProbes.Add(new DebugProbe(laneStart, laneEnd, false));
-                continue;
-            }
-
-            _debugProbes.Add(new DebugProbe(laneStart, hit.Position, true));
-
-            Vector3 hitNormal = NormalizeOrZero(hit.Normal);
-            // A ray parallel to the active surface may still touch the support
-            // mesh at a seam. That is not an obstacle for a body moving on the
-            // same plane; walls and other blocking faces remain candidates.
-            if (hitNormal.LengthSquared() > Epsilon * Epsilon &&
-                MathF.Abs(Vector3.Dot(hitNormal, surfaceNormal)) >= 0.92f)
-            {
-                continue;
-            }
-
+            QueryBudgetExhausted = true;
             return false;
         }
 
+        Vector3 direction = path / pathLength;
+        Vector3 width = NormalizeOrZero(Vector3.Cross(surfaceNormal, direction));
+        Vector3 displacement = direction * MathF.Min(pathLength, maxDistance);
+        Matrix4x4 orientation = new(
+            width.X, width.Y, width.Z, 0f,
+            surfaceNormal.X, surfaceNormal.Y, surfaceNormal.Z, 0f,
+            direction.X, direction.Y, direction.Z, 0f,
+            0f, 0f, 0f, 1f);
+        using (var capsule = new CapsuleShape(_profile.BodyCylinderHeight * 0.5f, _profile.BodyRadius))
+        {
+            if (ShapeTravelFraction(capsule, orientation * Matrix4x4.CreateTranslation(start),
+                    displacement, selfBody) < 1f)
+                return false;
+        }
+
+        // A swept footprint covers the entire width, not three rays with gaps.
+        // Use the same extent fore/aft: gait stance rotates while steering, so
+        // a zero-length cross section would detect turns into low boxes late.
+        // Its bottom stays above support seams, but below the body capsule's
+        // lowest point so low boxes cannot hide underneath the front probe.
+        float bottom = MathF.Max(_profile.CollisionSkinWorld * 2f, 0.025f);
+        float top = clearance + _profile.BodyRadius * 0.5f;
+        float halfHeight = (top - bottom) * 0.5f;
+        Vector3 bandCenter = start + surfaceNormal * ((top + bottom) * 0.5f - clearance);
+        float stanceExtent = SameSurfaceLegHalfWidth(clearance);
+        using var band = new BoxShape(new Vector3(stanceExtent, halfHeight, stanceExtent), 0.01f);
+        return ShapeTravelFraction(band, orientation * Matrix4x4.CreateTranslation(bandCenter),
+            displacement, selfBody) >= 1f;
+    }
+
+    private float SameSurfaceLegHalfWidth(float clearance) =>
+        // Include turn/waypoint tolerance and the motor's near-face lookahead.
+        // The profile has no rig-specific stance extents; this is deliberately
+        // conservative and never substitutes for gait pose validation.
+        MathF.Max(clearance * 3f, _profile.SurfaceTransitionProbeWorld + SameSurfaceDetourMargin);
+
+    private bool HasSameSurfaceRouteSupport(Vector3 start, Vector3 end,
+        in SpiderSurfaceContact source, Vector3 normal, float clearance, BodyID selfBody)
+    {
+        // Two bounded samples per leg reject raised tops and obvious gaps.
+        // This is a local route approximation, not an edge/ledge navigator.
+        for (int i = 1; i <= 2; i++)
+        {
+            Vector3 center = Vector3.Lerp(start, end, i * 0.5f);
+            if (!TryProbeContact(center + normal * 0.18f, -normal, clearance + 0.30f,
+                    selfBody, out SpiderSurfaceContact contact, out _) ||
+                Vector3.Dot(contact.Normal, normal) < 0.92f ||
+                MathF.Abs(Vector3.Dot(contact.Point - source.Point, normal)) >
+                    MathF.Max(_profile.ContactToleranceWorld * 2f, 0.04f))
+                return false;
+        }
         return true;
     }
 
@@ -878,7 +939,7 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         out float hitDistance)
     {
         direction = NormalizeOrZero(direction);
-        if (direction.LengthSquared() <= Epsilon * Epsilon)
+        if (direction.LengthSquared() <= Epsilon * Epsilon || !TakeRaycast())
         {
             contact = default;
             hitDistance = float.MaxValue;
@@ -939,7 +1000,7 @@ public sealed class SpiderSurfaceSolver : IGizmoDrawable
         float priority)
     {
         direction = NormalizeOrZero(direction);
-        if (direction.LengthSquared() <= Epsilon * Epsilon)
+        if (direction.LengthSquared() <= Epsilon * Epsilon || !TakeRaycast())
             return;
 
         bool didHit = _scene.Raycast(

@@ -40,11 +40,14 @@ internal sealed class SpiderLegKinematics
         out SpiderLegPose result, Func<SpiderLegPose, bool>? accept = null)
     {
         result = default;
-        if (!Finite(target) || !Finite(normal) || L1 < Epsilon || L2 < Epsilon) return false;
+        if (!Finite(target) || !Finite(normal) || L1 < Epsilon || L2 < Epsilon ||
+            Vector3.DistanceSquared(target, Rest.Hip) > Reach * Reach) return false;
         Vector3 radial = Normal(Project(target - Rest.Hip, normal), _outward);
         float restPitch = L3 > Epsilon ? MathF.Atan2(Vector3.Dot(Normal(Rest.Tip - Rest.Ankle, -normal), radial),
             Vector3.Dot(Normal(Rest.Tip - Rest.Ankle, -normal), -normal)) : 0f;
-        float bestScore = float.MaxValue;
+        // Eight pitches (including the previous pitch), six poles per pitch.
+        Span<(SpiderLegPose Pose, float Score)> candidates = stackalloc (SpiderLegPose, float)[48];
+        int candidateCount = 0;
         float previousPitch = L3 > Epsilon ? MathF.Atan2(Vector3.Dot(Normal(previous.Tip - previous.Ankle, -normal), radial),
             Vector3.Dot(Normal(previous.Tip - previous.Ankle, -normal), -normal)) : 0f;
         ReadOnlySpan<float> pitches = [0f, 20f, -20f, 40f, -40f, 60f, -60f];
@@ -76,12 +79,30 @@ internal sealed class SpiderLegKinematics
                 if (!WithinLimits(pose)) continue;
                 float score = Vector3.DistanceSquared(knee, previous.Knee) + Vector3.DistanceSquared(ankle, previous.Ankle) +
                     0.05f * Vector3.DistanceSquared(knee, Rest.Knee);
-                if (score >= bestScore || accept?.Invoke(pose) == false) continue;
-                result = pose;
-                bestScore = score;
+                if (score < float.MaxValue) candidates[candidateCount++] = (pose, score);
             }
         }
-        return bestScore < float.MaxValue;
+        // Stable insertion sort keeps the original candidate priority on ties.
+        // Validate only in score order, so no approved pose is later discarded.
+        for (int i = 1; i < candidateCount; i++)
+        {
+            var candidate = candidates[i];
+            int j = i;
+            while (j > 0 && candidates[j - 1].Score > candidate.Score)
+            {
+                candidates[j] = candidates[j - 1];
+                j--;
+            }
+            candidates[j] = candidate;
+        }
+        for (int i = 0; i < candidateCount; i++)
+        {
+            var pose = candidates[i].Pose;
+            if (accept?.Invoke(pose) == false) continue;
+            result = pose;
+            return true;
+        }
+        return false;
     }
 
     private bool WithinLimits(in SpiderLegPose p)

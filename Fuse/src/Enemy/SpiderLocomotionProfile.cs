@@ -16,12 +16,12 @@ public sealed class SpiderLocomotionProfile
     public float MaximumTurnSpeedDegrees { get; init; } = 240f;
     public float SurfaceTransitionProbeWorld { get; init; } = 2.6f;
     public float MaximumSurfaceTransitionSeconds { get; init; } = 6f;
-    public float StepTriggerFractionOfReach { get; init; } = 0.12f;
+    public float StepTriggerFractionOfReach { get; init; } = 0.16f;
     public float StanceRadiusScale { get; init; } = 0.82f;
-    public float StepPredictionSeconds { get; init; } = 0.12f;
-    public float StepDurationSeconds { get; init; } = 0.22f;
-    public float MinimumStepDurationSeconds { get; init; } = 0.12f;
-    public int MaximumSwingLegs { get; init; } = 2;
+    public float StepPredictionSeconds { get; init; } = 0.18f;
+    public float StepDurationSeconds { get; init; } = 0.18f;
+    public float MinimumStepDurationSeconds { get; init; } = 0.10f;
+    public int MaximumSwingLegs { get; init; } = 4;
     public int MinimumSupportLegs { get; init; } = 4;
     public float SupportPolygonMargin { get; init; } = 0.02f;
     public float ContactToleranceWorld { get; init; } = 0.015f;
@@ -46,12 +46,17 @@ public sealed class SpiderLocomotionProfile
     public float MaximumFootOffsetWorld { get; init; } = 0.12f;
     public float MinimumStepLiftFractionOfReach { get; init; } = 0.055f;
     public float MaximumStepLiftFractionOfReach { get; init; } = 0.45f;
-    public float MinimumStepLiftWorld { get; init; } = 0.30f;
+    public float MinimumStepLiftWorld { get; init; } = 0.12f;
     public float MaximumStepLiftWorld { get; init; } = 1.45f;
 
     public int SurfaceSwitchConfirmationFrames { get; init; } = 3;
     public float SurfaceNormalContinuity { get; init; } = 0.78f;
     public int MaximumBlockedStepFrames { get; init; } = 2;
+    public float BlockedStepRecoverySeconds { get; init; } = 0.35f;
+
+    // Bound speculative IK/path work even when every landing is obstructed.
+    public int MaximumShapeQueriesPerUpdate { get; init; } = 512;
+    public int MaximumRaycastsPerUpdate { get; init; } = 192;
 }
 
 public sealed class SpiderJointLimits

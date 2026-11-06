@@ -28,6 +28,7 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
     private Vector3 _debugTargetPosition;
     private Vector3 _plannedWaypointPosition;
     private Vector3 _plannedSourceNormal;
+    private Vector3 _plannedSourcePosition;
     private SpiderSurfaceContact _plannedTransition;
     private float _plannedClearance;
     private float _plannedScore = float.MaxValue;
@@ -35,6 +36,9 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
     private float _searchCooldown;
     private float _sameSurfaceDetourTimer;
     private Vector3 _sameSurfaceDetourSide;
+    private Vector3 _sameSurfaceDetourExit;
+    private Vector3 _plannedTargetPosition;
+    private bool _hasSameSurfaceDetourExit;
     private bool _hasPlan;
     private bool _hasSurfaceWaypoint;
     private bool _surfaceWaypointIsObstacleDetour;
@@ -64,10 +68,9 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
     }
 
     /// <summary>
-    /// Attempts to install a short-lived waypoint on the current surface when
-    /// a direct pursuit ray is blocked. The waypoint is committed until
-    /// reached, so the spider does not alternate between left and right while
-    /// it is passing the obstacle.
+    /// Installs a committed two-stage route when the direct feet/body corridor
+    /// is blocked: move out to one side, then advance beyond the obstacle before
+    /// reconnecting. Steering does not re-probe or switch sides each frame.
     /// </summary>
     public bool TryGetSameSurfaceDetour(
         float dt,
@@ -81,9 +84,7 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
     {
         direction = Vector3.Zero;
         dt = System.Math.Clamp(dt, 0.0001f, 0.05f);
-        _sameSurfaceDetourTimer = MathF.Max(
-            0f,
-            _sameSurfaceDetourTimer - dt);
+        InvalidateMovedTarget(targetPosition, currentPosition);
         _debugCurrentPosition = currentPosition;
         _debugTargetPosition = targetPosition;
         _plannedClearance = MathF.Max(0.01f, clearance);
@@ -100,6 +101,7 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
                 out _);
         }
 
+        _sameSurfaceDetourTimer = MathF.Max(0f, _sameSurfaceDetourTimer - dt);
         if (_sameSurfaceDetourTimer > 0f)
             return false;
 
@@ -115,7 +117,8 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
                     : Vector3.Zero,
                 out Vector3 waypoint,
                 out float detourScore,
-                out Vector3 selectedSide))
+                out Vector3 selectedSide,
+                out Vector3 exitWaypoint))
         {
             Vector3 detourDirection = NormalizeOrZero(
                 ProjectOnPlane(waypoint - currentPosition, currentNormal));
@@ -123,7 +126,11 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
             {
                 _plannedDirection = detourDirection;
                 _plannedWaypointPosition = waypoint;
+                _sameSurfaceDetourExit = exitWaypoint;
+                _hasSameSurfaceDetourExit = true;
+                _plannedTargetPosition = targetPosition;
                 _plannedSourceNormal = NormalizeOrZero(currentNormal);
+                _plannedSourcePosition = currentPosition;
                 _plannedTransition = default;
                 _plannedScore = detourScore;
                 _hasSurfaceWaypoint = true;
@@ -176,7 +183,12 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
 
         if (_hasSurfaceWaypoint)
         {
+            if (_surfaceWaypointIsObstacleDetour && !IsOnPlannedSourceSurface(currentNormal))
+                return false;
+            AdvanceSameSurfaceDetour(currentPosition, currentNormal);
             Vector3 toWaypoint = _plannedWaypointPosition - currentPosition;
+            if (_surfaceWaypointIsObstacleDetour)
+                toWaypoint = ProjectOnPlane(toWaypoint, currentNormal);
             distance = toWaypoint.Length();
             direction = NormalizeOrZero(
                 ProjectOnPlane(toWaypoint, currentNormal));
@@ -228,11 +240,12 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
         Vector3 currentNormal = NormalizeOrZero(currentSurfaceNormal);
         if (_hasSurfaceWaypoint)
         {
+            AdvanceSameSurfaceDetour(currentPosition ?? _debugCurrentPosition, currentNormal);
+            if (_hasSameSurfaceDetourExit)
+                return false;
             return IsOnPlannedSourceSurface(currentNormal) &&
-                   Vector3.Distance(
-                        _plannedWaypointPosition,
-                        currentPosition ?? _debugCurrentPosition) <=
-                        SurfaceWaypointReachDistance;
+                   ProjectOnPlane(_plannedWaypointPosition - (currentPosition ?? _debugCurrentPosition),
+                        currentNormal).Length() <= SurfaceWaypointReachDistance;
         }
 
         if (!_plannedTransition.IsValid)
@@ -264,6 +277,7 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
         dt = System.Math.Clamp(dt, 0.0001f, 0.05f);
         _decisionTimer = MathF.Max(0f, _decisionTimer - dt);
         _searchCooldown = MathF.Max(0f, _searchCooldown - dt);
+        InvalidateMovedTarget(targetPosition, currentPosition);
         _debugCurrentPosition = currentPosition;
         _debugTargetPosition = targetPosition;
         _plannedClearance = MathF.Max(0.01f, clearance);
@@ -301,12 +315,14 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
                 out float bestScore))
         {
             _plannedDirection = bestDirection;
+            _plannedTargetPosition = targetPosition;
             _hasSurfaceWaypoint = false;
             _surfaceWaypointIsObstacleDetour = false;
             _sameSurfaceDetourSide = Vector3.Zero;
             _hasSameSurfaceDetourSide = false;
             _plannedWaypointPosition = Vector3.Zero;
             _plannedSourceNormal = NormalizeOrZero(currentNormal);
+            _plannedSourcePosition = currentPosition;
             _plannedTransition = bestTransition;
             _plannedScore = bestScore;
             _hasPlan = true;
@@ -356,13 +372,15 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
         _hasSurfaceWaypoint = false;
         _plannedDirection = Vector3.Zero;
         _plannedWaypointPosition = Vector3.Zero;
-        _plannedSourceNormal = Vector3.Zero;
+        _plannedSourceNormal = _plannedSourcePosition = Vector3.Zero;
         _plannedTransition = default;
         _plannedScore = float.MaxValue;
         _surfaceWaypointIsObstacleDetour = false;
-        _decisionTimer = 0f;
-        _searchCooldown = 0f;
-        _sameSurfaceDetourTimer = 0f;
+        _hasSameSurfaceDetourExit = false;
+        _sameSurfaceDetourExit = Vector3.Zero;
+        _plannedTargetPosition = Vector3.Zero;
+        // Clearing (including an already empty plan) must not erase the retry
+        // clock. Otherwise a direct-path caller can force a search every frame.
         if (!preserveSameSurfaceDetourSide)
         {
             _sameSurfaceDetourSide = Vector3.Zero;
@@ -372,9 +390,36 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
 
     public void AbandonPlan()
     {
-        ClearPlan();
+        ClearPlan(preserveSameSurfaceDetourSide: IsSameSurfaceDetourActive);
         _decisionTimer = FailedSearchCooldown;
         _searchCooldown = FailedSearchCooldown;
+        _sameSurfaceDetourTimer = FailedSearchCooldown;
+    }
+
+    private void AdvanceSameSurfaceDetour(Vector3 position, Vector3 normal)
+    {
+        if (!_hasSameSurfaceDetourExit || !IsOnPlannedSourceSurface(normal) ||
+            ProjectOnPlane(_plannedWaypointPosition - position, normal).LengthSquared() >
+                SurfaceWaypointReachDistance * SurfaceWaypointReachDistance)
+            return;
+        _plannedWaypointPosition = _sameSurfaceDetourExit;
+        _hasSameSurfaceDetourExit = false;
+        _plannedDirection = NormalizeOrZero(ProjectOnPlane(_plannedWaypointPosition - position, normal));
+    }
+
+    private void InvalidateMovedTarget(Vector3 targetPosition, Vector3 currentPosition)
+    {
+        if (!_hasPlan) return;
+        float threshold = MathF.Max(2f, _plannedClearance * 3f);
+        bool movedSourcePlane = _surfaceWaypointIsObstacleDetour &&
+            MathF.Abs(Vector3.Dot(currentPosition - _plannedSourcePosition, _plannedSourceNormal)) > 0.1f;
+        if (!movedSourcePlane && IsFinite(targetPosition) &&
+            Vector3.DistanceSquared(targetPosition, _plannedTargetPosition) <= threshold * threshold)
+            return;
+        ClearPlan();
+        _decisionTimer = MathF.Max(_decisionTimer, DecisionInterval);
+        _searchCooldown = MathF.Max(_searchCooldown, DecisionInterval);
+        _sameSurfaceDetourTimer = MathF.Max(_sameSurfaceDetourTimer, DecisionInterval);
     }
 
     private bool TryCreateSurfaceWaypoint(
@@ -400,9 +445,11 @@ public sealed class SpiderSurfacePursuitPlanner : IGizmoDrawable
             return false;
 
         _plannedDirection = direction;
+        _plannedTargetPosition = targetPosition;
         _plannedWaypointPosition = currentPosition +
                                     direction * SurfaceAdvanceDistance;
         _plannedSourceNormal = currentNormal;
+        _plannedSourcePosition = currentPosition;
         _plannedTransition = default;
         _plannedScore = Vector3.Distance(
             _plannedWaypointPosition,

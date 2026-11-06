@@ -7,7 +7,8 @@ namespace Fuse.Enemy;
 public readonly record struct SpiderLocomotionPose(
     Vector3 Position, Quaternion Rotation, Vector3 Velocity, Vector3 AngularVelocity,
     float Scale, BodyID BodyId, SpiderSurfaceContact Support,
-    Vector3 SupportVelocity = default, Vector3 SupportAngularVelocity = default)
+    Vector3 SupportVelocity = default, Vector3 SupportAngularVelocity = default,
+        Vector3 DesiredRelativeVelocity = default)
 {
     public Vector3 RelativeVelocity => Velocity - SupportVelocity;
     public Vector3 RelativeAngularVelocity => AngularVelocity - SupportAngularVelocity;

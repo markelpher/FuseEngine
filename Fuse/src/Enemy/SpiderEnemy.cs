@@ -49,6 +49,13 @@ public sealed class SpiderEnemy : IEnemy, Debug.IGizmoDrawable
     public SpiderSurfaceMotor? SurfaceMotor => _surfaceMotor;
 
     public SpiderDamageBody? DamageBody => _damageBody;
+        public SpiderAiState AiState => _spiderPatrol?.State ?? SpiderAiState.Disabled;
+        public int PlantedLegCount => _proceduralWalk?.PlantedLegCount ?? 0;
+        public int SwingLegCount => _proceduralWalk?.SwingLegCount ?? 0;
+        public int BlockedLegCount => _proceduralWalk?.BlockedLegCount ?? 0;
+        public int LocomotionShapeQueries => _surfaceSolver?.FrameShapeQueries ?? 0;
+        public int LocomotionRaycasts => _surfaceSolver?.FrameRaycasts ?? 0;
+        public bool LocomotionBudgetExhausted => _surfaceSolver?.QueryBudgetExhausted ?? false;
 
     private readonly AssetManager _assets;
     private Scene.SceneManager? _sceneManager;
@@ -177,6 +184,8 @@ public sealed class SpiderEnemy : IEnemy, Debug.IGizmoDrawable
             .SetAllowedDOFs(AllowedDOFs.All)
             .Build(physics);
 
+        if (!Body.IsBuilt)
+            throw new InvalidOperationException($"Spider '{Id}' could not create its movement body; physics body capacity may be exhausted.");
 
         _model = _assets.GetSkinnedModel(Bible.Model(Bible.SpiderModel))?.CreateInstance();
 
@@ -262,6 +271,7 @@ public sealed class SpiderEnemy : IEnemy, Debug.IGizmoDrawable
         if (_proceduralWalk != null)
         {
             _surfaceMotor.BodyPoseValidator = _proceduralWalk.CanOccupyPose;
+                        _surfaceMotor.BodyPoseFailureDescription = () => _proceduralWalk.LastBodyBlockReason;
             _surfaceMotor.PoseReset += _proceduralWalk.ResetContacts;
         }
         _spiderPatrol = new SpiderPatrol(
@@ -896,7 +906,8 @@ public sealed class SpiderEnemy : IEnemy, Debug.IGizmoDrawable
             var pose = new SpiderLocomotionPose(
                 Entity.Transform.Position + Entity.ModelOffset, Entity.Transform.Rotation,
                 _surfaceMotor.CurrentVelocity, _surfaceMotor.CurrentAngularVelocity, totalScale.X,
-                Body.Native, _surfaceMotor.SurfaceContact, _surfaceMotor.SupportVelocity, _surfaceMotor.SupportAngularVelocity);
+                Body.Native, _surfaceMotor.SurfaceContact, _surfaceMotor.SupportVelocity, _surfaceMotor.SupportAngularVelocity,
+                                _surfaceMotor.DesiredRelativeVelocity);
             _proceduralWalk.Update(dt, pose);
         }
 
@@ -1069,7 +1080,8 @@ public sealed class SpiderEnemy : IEnemy, Debug.IGizmoDrawable
         // de criar o ragdoll evita corpos duplicados no mesmo lugar.
         _damageBody?.Dispose();
         _damageBody = null;
-        _surfaceSolver?.SetIgnoredBodies(null);
+        _surfaceSolver?.Dispose();
+                _surfaceSolver = null;
 
         // EDITAR AQUI — criar o ragdoll articulado usando a pose atual dos ossos.
         if (_model != null &&
@@ -1163,6 +1175,8 @@ public sealed class SpiderEnemy : IEnemy, Debug.IGizmoDrawable
         if (Body.IsBuilt) _sceneManager?.NonWalkableBodies.Remove(Body.Native);
         _surfaceMotor?.Dispose();
         _surfaceMotor = null;
+        _surfaceSolver?.Dispose();
+        _surfaceSolver = null;
 
         _damageBody?.Dispose();
         _damageBody = null;

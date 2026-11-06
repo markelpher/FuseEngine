@@ -49,10 +49,10 @@ You also can open the game directly from the map editor by pressing F5.
 | `Insert` | Open/close the ImGui debug interface |
 | `F1` | Toggle noclip mode |
 | `F2` | Capture a screenshot |
-| `F3` | Toggle spider pursuit of the player |
+| `F3` | Toggle spider pursuit; switching it on also enables spider AI |
 | `F4` | Reload all shaders |
 | `F5` | Reload the current map |
-| `F6` | Toggle patrol AI |
+| `F6` | Pause/resume AI, including active spider pursuit |
 | `F8` | Toggle enemy selection mode; requires the Debug Drawer to be active |
 | `F9` | Toggle the Debug Drawer |
 | `F10` | Toggle post-processing |
@@ -71,3 +71,20 @@ These keys work during gameplay or when the weapon context is active:
 | `Z` | Apply test damage to the player |
 
 When an interface window is capturing the keyboard or mouse, the corresponding gameplay controls are blocked.
+
+### Spider locomotion checks
+
+The procedural spider uses alternating tetrads, with collision-checked steps and at least four supporting legs. To inspect it in game, spawn one with `V`, enable the Debug Drawer with `F9`, then use `F8` and click the enemy. The selection HUD shows AI state, actual/intended speed, leg support counts, body-motion rejection reasons and bounded shape/raycast counts. `F3` toggles pursuit; `F6` pauses/resumes AI without clearing the chase selection. Spiders brake and hold near the player, restart when the player moves away, and use committed local detours around obstacles. F3 OFF resumes local patrol. Player death disables pursuit; enable F3 again after respawn.
+
+Headless regression checks (run from the repository root):
+
+```sh
+dotnet run --project tests/SpiderLocomotion.Tests
+dotnet run --project tests/SpiderLocomotion.Integration -- --case all
+dotnet run --project tests/SpiderNativeResources.Tests
+dotnet run --project tests/SpiderTargetSurface.Tests
+dotnet run --project tests/SpiderNavigation.Tests
+dotnet run --project tests/SpiderAi.Integration -- --case all
+```
+
+The integration harness uses the real FBX rig and Jolt, without a rendering window, and reports per-fixed-update CPU cost, allocations and query budgets. For a sustained obstruction test, use `--case blocked --frames 3600`. The native-resource harness checks ownership/disposal and safe failure when the physics body pool is full. See `tests/SpiderLocomotion.Integration/README.md` for coverage and limitations; visual validation in game is still necessary.

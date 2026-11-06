@@ -13,7 +13,6 @@ namespace Fuse.Core;
 
 public static class DevShortcuts
 {
-    private static bool _enableAI = true;
 
     public static void HandleInput(
         SceneManager sceneManager,
@@ -33,7 +32,7 @@ public static class DevShortcuts
         if (Input.Input.KeyPressed(KeyCodes.F2))
             screenshotRequested = true;
 
-        // F3: make every spider point its movement direction toward the player.
+        // F3 explicitly enables chasing, even if patrol was paused with F6.
         if (Input.Input.KeyPressed(KeyCodes.F3))
         {
             SpiderPatrol.SetPursuitEnabled(!SpiderPatrol.PursuitEnabled);
@@ -47,11 +46,11 @@ public static class DevShortcuts
         if (Input.Input.KeyPressed(KeyCodes.F6))
         {
 
-            _enableAI = !_enableAI;
-            EnemyPatrol.Enabled = _enableAI;
-            SpiderPatrol.Enabled = _enableAI;
-            Logger.Info($"[DevShortcuts] Patrol {(_enableAI ? "ON" : "OFF")}");
-            GameNotify.Info($"PatrolAI {(_enableAI ? "ON" : "OFF")}");
+            bool enableAI = !(EnemyPatrol.Enabled || SpiderPatrol.Enabled);
+            EnemyPatrol.Enabled = enableAI;
+            SpiderPatrol.Enabled = enableAI;
+            Logger.Info($"[DevShortcuts] Patrol {(enableAI ? "ON" : "OFF")}");
+            GameNotify.Info($"PatrolAI {(enableAI ? "ON" : "OFF")}");
         }
     
         // Map reload

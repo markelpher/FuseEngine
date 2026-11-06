@@ -60,6 +60,7 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
     private SpiderSurfaceContact _transitionGuide;
     private bool _hasTransitionGuide;
     private bool _disposed;
+        private bool _updatePrepared;
     private BodyID _previousSupportId = BodyID.Invalid;
     private Quaternion _previousSupportRotation = Quaternion.Identity;
 
@@ -72,11 +73,15 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
     public Vector3 DesiredDirection => _desiredDirection;
     public Vector3 MovementDirection => _movementDirection;
     public Vector3 CurrentVelocity { get; private set; }
+        public Vector3 DesiredRelativeVelocity { get; private set; }
+        public float AcceptedMotionFraction { get; private set; } = 1f;
     public float CurrentSpeed { get; private set; }
     public Vector3 CurrentAngularVelocity { get; private set; }
     public Vector3 SupportVelocity { get; private set; }
     public Vector3 SupportAngularVelocity { get; private set; }
     public Func<Vector3, Quaternion, bool>? BodyPoseValidator { get; set; }
+        public Func<string>? BodyPoseFailureDescription { get; set; }
+        public string LastBodyBlockReason { get; private set; } = "";
     public event Action? PoseReset;
     public bool IsBlocked { get; private set; }
     public bool HasSurface => _surfaceContact.IsValid && _lostSurfaceTime <= SurfaceLostGrace;
@@ -166,7 +171,8 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
         _hasTransitionGuide = false;
         _airVelocity = Vector3.Zero;
         _requestedVelocity = Vector3.Zero;
-        CurrentVelocity = Vector3.Zero;
+        CurrentVelocity = DesiredRelativeVelocity = Vector3.Zero;
+        AcceptedMotionFraction = 1f;
         CurrentSpeed = 0f;
         IsBlocked = false;
         _debugPredictedPosition = position;
@@ -261,7 +267,13 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
         DebugDrawer.Register(this);
     }
 
-    public void Update(float dt, Vector3 intendedDirection, float intendedSpeed)
+    public void PrepareUpdate()
+        {
+            _solver.BeginFrame();
+            _updatePrepared = true;
+        }
+
+        public void Update(float dt, Vector3 intendedDirection, float intendedSpeed)
     {
         if (_disposed || !_body.IsBuilt)
             return;
@@ -273,7 +285,12 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
         // local plans forever even after the body has moved away from the
         // obstruction.
         IsBlocked = false;
-        _solver.BeginFrame();
+        AcceptedMotionFraction = 1f;
+        LastBodyBlockReason = "";
+        DesiredRelativeVelocity = Vector3.Zero;
+        if (!_updatePrepared) _solver.BeginFrame();
+        _updatePrepared = false;
+        _solver.BeginMotor();
 
         _transitionCooldown = MathF.Max(0f, _transitionCooldown - dt);
         if (_transitionActive)
@@ -424,6 +441,7 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
         Vector3 turnedForward = Vector3.Transform(oldForward, Quaternion.CreateFromAxisAngle(up, System.Math.Clamp(turn, -turnLimit, turnLimit)));
         Character.Rotation = RotationFromSurface(up, turnedForward, oldForward);
         commandSpeed *= MathF.Max(0f, Vector3.Dot(turnedForward, tangent));
+                DesiredRelativeVelocity = HasSurface ? tangent * commandSpeed : Vector3.Zero;
 
         if (HasSurface)
         {
@@ -450,11 +468,13 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
         UpdatePostMoveContact(dt, ref endPosition, up);
         if (HasSurface && BodyPoseValidator != null && !BodyPoseValidator(endPosition, Character.Rotation))
         {
+            LastBodyBlockReason = BodyPoseFailureDescription?.Invoke() ?? "body pose rejected";
             Vector3 requestedEnd = endPosition;
             Quaternion requestedRotation = Character.Rotation;
             float accepted = 0f;
             // Keep the largest safe portion of the fixed-step body motion.
-            for (float fraction = 0.5f; fraction >= 0.0625f; fraction *= 0.5f)
+            ReadOnlySpan<float> fractions = [0.875f, 0.75f, 0.5f, 0.25f, 0.125f, 0.0625f];
+            foreach (float fraction in fractions)
             {
                 var candidatePosition = Vector3.Lerp(startPosition, requestedEnd, fraction);
                 var candidateRotation = Quaternion.Slerp(startRotation, requestedRotation, fraction);
@@ -462,11 +482,12 @@ public sealed class SpiderSurfaceMotor : IGizmoDrawable, IDisposable
                 accepted = fraction;
                 break;
             }
-            endPosition = Vector3.Lerp(startPosition, requestedEnd, accepted);
+            AcceptedMotionFraction = accepted;
+                        endPosition = Vector3.Lerp(startPosition, requestedEnd, accepted);
             Character.Position = endPosition;
             Character.Rotation = Quaternion.Slerp(startRotation, requestedRotation, accepted);
             Character.Up = _surfaceNormal = Vector3.Transform(Vector3.UnitY, Character.Rotation);
-            IsBlocked = true;
+            IsBlocked = accepted < 0.12f;
         }
         Vector3 actualVelocity = (endPosition - simulationStartPosition) / dt;
         CurrentVelocity = actualVelocity;

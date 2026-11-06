@@ -21,6 +21,16 @@ public sealed class EnemySystem : IDisposable
     private readonly SpiderTargetSurfaceResolver _spiderTargetSurfaceResolver;
     private Player.Player? _player;
     private float _contactDamageCooldown;
+    private const float PursuitProbeInterval = 0.1f;
+    private const float PursuitSupportSearchDistance = 0.6f;
+    private const float PursuitSurfaceRetention = 0.35f;
+    private const float PursuitRetentionDistance = 1.5f;
+    private Player.Player? _pursuitPlayer;
+    private SpiderTargetSurface _pursuitSurface;
+    private Vector3 _pursuitResolvedFeet;
+    private float _pursuitProbeCooldown;
+    private float _pursuitSurfaceAge;
+    private bool _pursuitWasGrounded;
 
     public EnemySystem(PhysicsWorld physics, Scene.SceneManager sceneManager, AssetManager assets)
     {
@@ -44,11 +54,20 @@ public sealed class EnemySystem : IDisposable
 
     public IReadOnlyList<SpiderEnemy> GetSpiders() => _spiders;
 
-    public SpiderEnemy SpawnSpider(Vector3 position, float health = 80f, Vector3? surfaceNormal = null)
+    public SpiderEnemy? SpawnSpider(Vector3 position, float health = 80f, Vector3? surfaceNormal = null)
     {
         string id = $"spider_{_spiders.Count}";
         var spider = new SpiderEnemy(id, health, _assets);
-        spider.Initialize(_physics, _sceneManager, position, surfaceNormal);
+        try
+        {
+            spider.Initialize(_physics, _sceneManager, position, surfaceNormal);
+        }
+        catch (InvalidOperationException exception) when (!spider.Body.IsBuilt)
+        {
+            spider.Dispose();
+            Core.Logger.Warn($"Could not spawn spider: {exception.Message}");
+            return null;
+        }
         _spiders.Add(spider);
         RegisterSpiderDamageBodies(spider);
         return spider;
@@ -56,30 +75,72 @@ public sealed class EnemySystem : IDisposable
 
     public void Update(float dt)
     {
-        if (SpiderPatrol.PursuitEnabled && _player != null && !_player.IsDead)
+        if (SpiderPatrol.PursuitEnabled && _player != null && !_player.IsDead &&
+            float.IsFinite(_player.FeetPosition.LengthSquared()))
         {
-            SpiderPatrol.SetPursuitTarget(_player.Position);
-
-            Vector3 preferredNormal = _player.NativeCharacter.GroundNormal;
-            if (_spiderTargetSurfaceResolver.TryResolve(
-                    _player.Position,
-                    preferredNormal,
-                    8f,
-                    out SpiderTargetSurface targetSurface))
+            Vector3 feetPosition = _player.FeetPosition;
+            CharacterVirtual character = _player.NativeCharacter;
+            bool grounded = !_player.IsNoclip && character.GroundState == GroundState.OnGround;
+            float elapsed = float.IsFinite(dt) && dt > 0f ? dt : 0f;
+            bool displaced = _pursuitSurface.IsValid &&
+                Vector3.DistanceSquared(feetPosition, _pursuitResolvedFeet) >
+                PursuitRetentionDistance * PursuitRetentionDistance;
+            bool removedSupport = _pursuitSurface.IsValid &&
+                (!_physics.BodyInterface.IsAdded(_pursuitSurface.BodyId) ||
+                 _sceneManager.NonWalkableBodies.Contains(_pursuitSurface.BodyId));
+            if (!ReferenceEquals(_pursuitPlayer, _player) || displaced || removedSupport)
             {
+                _pursuitPlayer = _player;
+                _pursuitSurface = default;
+                _pursuitProbeCooldown = 0f;
+                _pursuitSurfaceAge = 0f;
+                _pursuitWasGrounded = false;
+            }
+
+            _pursuitSurfaceAge += elapsed;
+            _pursuitProbeCooldown -= elapsed;
+            if (!_player.IsNoclip && (_pursuitProbeCooldown <= 0f || (grounded && !_pursuitWasGrounded)))
+            {
+                // One shared query at 10 Hz, at most six local rays (normally
+                // one). Landing, target replacement and teleports query now.
+                _pursuitProbeCooldown = PursuitProbeInterval;
+                if (_spiderTargetSurfaceResolver.TryResolvePlayer(
+                        feetPosition, character, PursuitSupportSearchDistance,
+                        out SpiderTargetSurface targetSurface))
+                {
+                    _pursuitSurface = targetSurface;
+                    _pursuitSurfaceAge = 0f;
+                    _pursuitResolvedFeet = feetPosition;
+                }
+            }
+            _pursuitWasGrounded = grounded;
+
+            if (_pursuitSurface.IsValid && _pursuitSurfaceAge <= PursuitSurfaceRetention)
+            {
+                // Retain the physical point, not an unverified projection of
+                // the jumping player's new position onto an old support plane.
+                SpiderPatrol.SetPursuitTarget(_pursuitSurface.Point);
                 SpiderPatrol.SetPursuitTargetSurface(
-                    targetSurface.Point,
-                    targetSurface.Normal,
-                    targetSurface.BodyId);
+                    _pursuitSurface.Point, _pursuitSurface.Normal, _pursuitSurface.BodyId);
             }
             else
             {
+                _pursuitSurface = default;
+                SpiderPatrol.SetPursuitTarget(feetPosition);
                 SpiderPatrol.ClearPursuitTargetSurface();
             }
         }
         else
         {
-            SpiderPatrol.ClearPursuitTargetSurface();
+            _pursuitPlayer = null;
+            _pursuitSurface = default;
+            _pursuitProbeCooldown = 0f;
+            _pursuitSurfaceAge = 0f;
+            _pursuitWasGrounded = false;
+            SpiderPatrol.ClearPursuitTarget();
+            // Clearing only the surface leaves Patrol pursuing its static raw
+            // target. An unavailable/dead player must stop pursuit altogether.
+            SpiderPatrol.SetPursuitEnabled(false);
         }
 
         for (int i = _enemies.Count - 1; i >= 0; i--)
@@ -104,6 +165,8 @@ public sealed class EnemySystem : IDisposable
             if (s.IsDead)
             {
                 UnregisterSpiderDamageBodies(s);
+                if (s.Body.IsBuilt)
+                    _sceneManager.ActiveScene.UnregisterBody(s.Entity);
                 s.OnDeath(_physics, _sceneManager);
                 s.Update(dt, _physics);
                 
@@ -254,6 +317,7 @@ public sealed class EnemySystem : IDisposable
         {
             var e = _enemies[i];
 
+            _sceneManager.ActiveScene.Remove(e.Entity);
             e.Character?.Dispose();
 
             if (e.Body.IsBuilt)
@@ -262,7 +326,6 @@ public sealed class EnemySystem : IDisposable
                 e.Body.Destroy();
             }
 
-            _sceneManager.ActiveScene.Remove(e.Entity);
             e.Dispose();
         }
 
@@ -272,6 +335,8 @@ public sealed class EnemySystem : IDisposable
         {
             var s = _spiders[i];
             UnregisterSpiderDamageBodies(s);
+            _sceneManager.ActiveScene.Remove(s.Entity);
+            s.Dispose();
 
             if (s.Body.IsBuilt)
             {
@@ -279,12 +344,11 @@ public sealed class EnemySystem : IDisposable
                 s.Body.Destroy();
             }
 
-            _sceneManager.ActiveScene.Remove(s.Entity);
-            s.Dispose();
         }
 
         _spiders.Clear();
         _spiderDamageBodies.Clear();
+        _spiderMovementBodiesForRaycast.Clear();
     }
 
     private void RegisterSpiderDamageBodies(SpiderEnemy spider)

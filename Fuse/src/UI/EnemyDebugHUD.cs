@@ -86,6 +86,17 @@ public sealed class EnemyDebugHUD
         _lines[7].Text = $"Loop: {(animLoop ? "ON" : "OFF")}";
         _lines[8].Text = $"BodyID: {e.Body.Native}";
 
+                if (e is SpiderEnemy spider && spider.SurfaceMotor is { } motor)
+                {
+                    _lines[2].Text = $"AI: {spider.AiState} | Pursuit {(SpiderPatrol.PursuitEnabled ? "ON" : "OFF")}";
+                    _lines[3].Text = $"Velocity: {motor.CurrentSpeed:F2} / intent {motor.DesiredRelativeVelocity.Length():F2} m/s";
+                    _lines[4].Text = $"Legs: support {spider.PlantedLegCount}, swing {spider.SwingLegCount}, blocked {spider.BlockedLegCount}";
+                    _lines[5].Text = $"Body motion accepted: {motor.AcceptedMotionFraction:P0}";
+                    _lines[6].Text = $"Surface: {(motor.HasSurface ? "attached" : "detached")}, transition: {motor.IsTransitioning}";
+                    _lines[7].Text = string.IsNullOrEmpty(motor.LastBodyBlockReason) ? "Gait: clear" : motor.LastBodyBlockReason;
+                    _lines[8].Text = $"Queries: {spider.LocomotionShapeQueries} shapes / {spider.LocomotionRaycasts} rays{(spider.LocomotionBudgetExhausted ? " (limited)" : "")}";
+                }
+
         for (int i = 0; i < _lines.Count; i++)
         {
             _lines[i].SetScreenPosition(basePos + new Vector2(0, i * lineHeight));

@@ -7,6 +7,11 @@ using JoltPhysicsSharp;
 
 namespace Fuse.Enemy;
 
+public enum SpiderAiState
+{
+    Resting, Patrolling, Pursuing, Navigating, Arrived, Recovering, WaitingForSurface, Disabled
+}
+
 /// <summary>
 /// High-level wandering intent for the spider. This class never changes the
 /// rigid body directly; SpiderSurfaceMotor owns every physical displacement.
@@ -17,6 +22,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
     public static bool PursuitEnabled { get; private set; }
 
     private static Vector3 s_pursuitTarget;
+    private static bool s_hasPursuitTarget;
     private static Vector3 s_pursuitTargetSurfacePoint;
     private static Vector3 s_pursuitTargetSurfaceNormal;
     private static BodyID s_pursuitTargetSurfaceBodyId = BodyID.Invalid;
@@ -32,12 +38,19 @@ public sealed class SpiderPatrol : IGizmoDrawable
     private Vector3 _travelDirection = Vector3.Zero;
     private Vector3 _targetPosition;
     private float _remainingTravel;
+    // Keep movement intent independent of speed constrained by the motor/legs.
+    private float _commandSpeed;
     private float _waitTimer;
     private float _waitDuration;
     private float _blockedTimer;
     private float _pursuitBlockedTimer;
     private bool _initialized;
+    private bool _wasPursuing;
+    private bool _pursuitArrived;
+    private Vector3 _patrolOrigin;
 
+    public SpiderAiState State { get; private set; } = SpiderAiState.Resting;
+    public Vector3 NavigationTarget => _targetPosition;
     public float CurrentSpeed { get; private set; }
     public Vector3 CurrentVelocity { get; private set; }
     public Vector3 CurrentPosition => _enemy.Body.IsBuilt
@@ -50,6 +63,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
     public float Clearance => _motor.Clearance;
     public bool IsMovementReady => !_enemy.IsDead && _enemy.Body.IsBuilt;
     public static Vector3 PursuitTarget => s_pursuitTarget;
+    public static bool HasPursuitTarget => s_hasPursuitTarget;
     public static bool HasPursuitTargetSurface => s_hasPursuitTargetSurface;
     public static Vector3 PursuitTargetSurfacePoint => s_pursuitTargetSurfacePoint;
     public static Vector3 PursuitTargetSurfaceNormal => s_pursuitTargetSurfaceNormal;
@@ -64,6 +78,8 @@ public sealed class SpiderPatrol : IGizmoDrawable
     [Export] public float MinWaitTime { get; set; } = 0.7f;
     [Export] public float MaxWaitTime { get; set; } = 2.0f;
     [Export] public float MinTravelDistance { get; set; } = 4f;
+    [Export] public float PursuitStopDistance { get; set; } = 1.0f;
+    [Export] public float PursuitResumeDistance { get; set; } = 1.5f;
 
     private static readonly Random s_random = new();
 
@@ -80,9 +96,26 @@ public sealed class SpiderPatrol : IGizmoDrawable
         DebugDrawer.Register(this);
     }
 
-    public static void SetPursuitEnabled(bool enabled) => PursuitEnabled = enabled;
+    public static void SetPursuitEnabled(bool enabled)
+    {
+        PursuitEnabled = enabled;
+        // F3 is an explicit chase command, including after F6 paused the AI.
+        if (enabled) Enabled = true;
+    }
 
-    public static void SetPursuitTarget(Vector3 target) => s_pursuitTarget = target;
+    public static void SetPursuitTarget(Vector3 target)
+    {
+        if (!IsFinite(target)) { ClearPursuitTarget(); return; }
+        s_pursuitTarget = target;
+        s_hasPursuitTarget = true;
+    }
+
+    public static void ClearPursuitTarget()
+    {
+        s_pursuitTarget = Vector3.Zero;
+        s_hasPursuitTarget = false;
+        ClearPursuitTargetSurface();
+    }
 
     public static void SetPursuitTargetSurface(
         Vector3 surfacePoint,
@@ -113,20 +146,46 @@ public sealed class SpiderPatrol : IGizmoDrawable
 
     public void Update(float dt)
     {
-        if (!Enabled || _enemy.IsDead || !_enemy.Body.IsBuilt)
+        if (_enemy.IsDead || !_enemy.Body.IsBuilt)
             return;
+
+        _motor.PrepareUpdate();
+        if (!Enabled)
+        {
+            State = SpiderAiState.Disabled;
+            _commandSpeed = 0f;
+            _motor.Update(dt, _travelDirection, 0f);
+            CurrentVelocity = _motor.CurrentVelocity;
+            CurrentSpeed = _motor.CurrentSpeed;
+            UpdateAnimationSpeed();
+            return;
+        }
 
         if (!_initialized)
         {
             _travelDirection = NormalizeOrFallback(_motor.MovementDirection, _motor.Forward);
             _waitDuration = RandomWaitTime();
             _targetPosition = _enemy.Body.Position(_physics);
+            _patrolOrigin = _targetPosition;
             _initialized = true;
             PlayIdleAnimation();
         }
 
         dt = System.Math.Clamp(dt, 0.0001f, 0.05f);
         Vector3 positionBefore = _enemy.Body.Position(_physics);
+        if (_wasPursuing != PursuitEnabled)
+        {
+            _wasPursuing = PursuitEnabled;
+            _pursuitArrived = false;
+            _pursuitBlockedTimer = _blockedTimer = _commandSpeed = 0f;
+            _pursuitPlanner.ClearPlan();
+            _motor.ClearTransitionConstraint();
+            if (!PursuitEnabled)
+            {
+                _patrolOrigin = positionBefore;
+                BeginIdle(0.15f, 0.35f);
+            }
+        }
 
         if (PursuitEnabled)
         {
@@ -134,9 +193,10 @@ public sealed class SpiderPatrol : IGizmoDrawable
         }
         else if (_state == PatrolState.Idle)
         {
-            _pursuitPlanner.ClearPlan();
+            State = SpiderAiState.Resting;
+            if (_pursuitPlanner.HasPlan) _pursuitPlanner.ClearPlan();
             _motor.ClearTransitionConstraint();
-            CurrentSpeed = MathF.Max(0f, CurrentSpeed - Deceleration * dt);
+            _commandSpeed = MathF.Max(0f, _commandSpeed - Deceleration * dt);
             _motor.Update(dt, _travelDirection, 0f);
             _waitTimer += dt;
 
@@ -145,15 +205,16 @@ public sealed class SpiderPatrol : IGizmoDrawable
         }
         else
         {
-            _pursuitPlanner.ClearPlan();
+            State = SpiderAiState.Patrolling;
+            if (_pursuitPlanner.HasPlan) _pursuitPlanner.ClearPlan();
             _motor.ClearTransitionConstraint();
-            float stoppingDistance = CurrentSpeed * CurrentSpeed / MathF.Max(0.01f, 2f * Deceleration);
+            float stoppingDistance = _commandSpeed * _commandSpeed / MathF.Max(0.01f, 2f * Deceleration);
             if (_remainingTravel <= stoppingDistance + 0.4f)
-                CurrentSpeed = MathF.Max(0f, CurrentSpeed - Deceleration * dt);
+                _commandSpeed = MathF.Max(0f, _commandSpeed - Deceleration * dt);
             else
-                CurrentSpeed = MathF.Min(MoveSpeed, CurrentSpeed + Acceleration * dt);
+                _commandSpeed = MathF.Min(MoveSpeed, _commandSpeed + Acceleration * dt);
 
-            _motor.Update(dt, _travelDirection, CurrentSpeed);
+            _motor.Update(dt, _travelDirection, _commandSpeed);
             _travelDirection = NormalizeOrFallback(
                 _motor.MovementDirection,
                 ProjectOnPlane(_travelDirection, _motor.SurfaceNormal));
@@ -168,7 +229,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
             else
                 _blockedTimer = MathF.Max(0f, _blockedTimer - dt * 2f);
 
-            if (_remainingTravel <= 0.35f || CurrentSpeed <= 0.05f && _remainingTravel < 0.8f)
+            if (_remainingTravel <= 0.35f || _commandSpeed <= 0.05f && _remainingTravel < 0.8f)
             {
                 BeginIdle();
             }
@@ -179,12 +240,24 @@ public sealed class SpiderPatrol : IGizmoDrawable
         }
 
         CurrentVelocity = _motor.CurrentVelocity;
-        CurrentSpeed = _state == PatrolState.Walking ? _motor.CurrentSpeed : 0f;
+        CurrentSpeed = _motor.CurrentSpeed;
         UpdateAnimationSpeed();
     }
 
     private void UpdatePursuit(float dt, Vector3 currentPosition)
     {
+        State = SpiderAiState.Pursuing;
+        if (!HasPursuitTarget)
+        {
+            State = SpiderAiState.WaitingForSurface;
+            _state = PatrolState.Idle;
+            _commandSpeed = _pursuitBlockedTimer = 0f;
+            _pursuitArrived = false;
+            if (_pursuitPlanner.HasPlan) _pursuitPlanner.ClearPlan();
+            _motor.ClearTransitionConstraint();
+            _motor.Update(dt, _travelDirection, 0f);
+            return;
+        }
         Vector3 normal = NormalizeOrZero(_motor.SurfaceNormal);
         Vector3 targetSurfaceNormal = NormalizeOrZero(
             s_pursuitTargetSurfaceNormal);
@@ -246,6 +319,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
 
         if (_motor.IsTransitioning)
         {
+            State = SpiderAiState.Navigating;
             bool hasPlannedWaypoint =
                 _pursuitPlanner.HasPlan &&
                 _pursuitPlanner.PlannedTransition.IsValid;
@@ -292,7 +366,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
             if (hasTransitionDirection)
                 _travelDirection = transitionDirection;
             SyncTransitionConstraint();
-            _motor.Update(dt, _travelDirection, CurrentSpeed);
+            _motor.Update(dt, _travelDirection, _commandSpeed);
             UpdatePursuitBlockedState(dt);
             return;
         }
@@ -301,15 +375,34 @@ public sealed class SpiderPatrol : IGizmoDrawable
             ? MathF.Abs(Vector3.Dot(directionToTarget, normal))
             : 0f;
         float targetOutsideSurfaceDistance = MathF.Max(
-            _motor.Clearance * 1.5f,
-            0.75f);
+            _motor.Clearance * 0.2f,
+            0.1f);
         bool targetOutsideCurrentSurface =
             targetSurfaceDifferent ||
             (hasTargetSurface &&
              Vector3.Dot(normal, targetSurfaceNormal) < 0.90f) ||
-            normalSeparation > targetOutsideSurfaceDistance;
+            (hasTargetSurface && normalSeparation > targetOutsideSurfaceDistance);
         bool directDirectionAvailable =
             surfaceDirection.LengthSquared() > 0.0001f;
+
+        float targetDistance = ProjectOnPlane(directionToTarget, normal).Length();
+        float stopDistance = MathF.Max(0.25f, PursuitStopDistance);
+        float resumeDistance = MathF.Max(stopDistance + 0.25f, PursuitResumeDistance);
+        if (!targetOutsideCurrentSurface &&
+            targetDistance <= (_pursuitArrived ? resumeDistance : stopDistance) + 0.01f)
+        {
+            // Arrival is latched: small target/support changes must not make
+            // the spider repeatedly overshoot, reverse and restart its gait.
+            _pursuitArrived = true;
+            State = SpiderAiState.Arrived;
+            _state = PatrolState.Idle;
+            _commandSpeed = _pursuitBlockedTimer = 0f;
+            if (_pursuitPlanner.HasPlan) _pursuitPlanner.ClearPlan();
+            _motor.SetTransitionConstraint(normal);
+            _motor.Update(dt, _travelDirection, 0f);
+            return;
+        }
+        _pursuitArrived = false;
 
         // A same-surface detour belongs only to the current floor/plane. If
         // the player changes to another surface while the spider is moving
@@ -340,8 +433,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
         bool localPlanRequired =
             !directDirectionAvailable ||
             targetOutsideCurrentSurface ||
-            _pursuitBlockedTimer > 0.20f ||
-            _motor.IsBlocked;
+            _pursuitBlockedTimer > 0.65f;
         if (transitionExitLocked)
             localPlanRequired = false;
 
@@ -386,11 +478,10 @@ public sealed class SpiderPatrol : IGizmoDrawable
 
         if (directDirectionAvailable &&
             (!targetOutsideCurrentSurface || transitionExitLocked) &&
-            _pursuitBlockedTimer <= 0.20f &&
-            !_motor.IsBlocked &&
+            _pursuitBlockedTimer <= 0.65f &&
             !usingSameSurfaceDetour)
         {
-            _pursuitPlanner.ClearPlan();
+            if (_pursuitPlanner.HasPlan) _pursuitPlanner.ClearPlan();
             _travelDirection = surfaceDirection;
         }
         else if (hasLocalDirection)
@@ -410,10 +501,11 @@ public sealed class SpiderPatrol : IGizmoDrawable
             // Do not invent a random direction when the target is outside the
             // current surface. Stay attached and let the planner retry after
             // its cooldown.
-            _state = PatrolState.Walking;
-            CurrentSpeed = MathF.Max(
+            State = SpiderAiState.WaitingForSurface;
+            _state = PatrolState.Idle;
+            _commandSpeed = MathF.Max(
                 0f,
-                CurrentSpeed - Deceleration * dt);
+                _commandSpeed - Deceleration * dt);
             SyncTransitionConstraint(
                 currentPosition,
                 normal,
@@ -430,7 +522,10 @@ public sealed class SpiderPatrol : IGizmoDrawable
             _travelDirection = surfaceDirection;
         _state = PatrolState.Walking;
 
-        float speedLimit = MoveSpeed;
+        State = usingLocalDirection ? SpiderAiState.Navigating : SpiderAiState.Pursuing;
+        float speedLimit = targetOutsideCurrentSurface ? MoveSpeed : MathF.Min(MoveSpeed,
+            MathF.Min(MathF.Sqrt(2f * MathF.Max(0.01f, Deceleration) * MathF.Max(0f, targetDistance - stopDistance)),
+                MathF.Max(0f, targetDistance - stopDistance) / dt));
         if (usingLocalDirection &&
             _pursuitPlanner.TryGetSteeringDirection(
                 currentPosition,
@@ -439,7 +534,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
                 out float waypointDistance))
         {
             _travelDirection = waypointDirection;
-            speedLimit = CalculateWaypointSpeedLimit(dt, waypointDistance);
+            speedLimit = MathF.Min(speedLimit, CalculateWaypointSpeedLimit(dt, waypointDistance));
             if (speedLimit <= 0.001f &&
                 _motor.TransitionLockRemaining <= 0f &&
                 _pursuitPlanner.IsOnPlannedSourceSurface(normal))
@@ -462,13 +557,16 @@ public sealed class SpiderPatrol : IGizmoDrawable
                 targetSurfaceNormal,
                 s_pursuitTargetSurfaceBodyId);
         }
-        _motor.Update(dt, _travelDirection, CurrentSpeed);
+        _motor.Update(dt, _travelDirection, _commandSpeed);
         UpdatePursuitBlockedState(dt);
     }
 
     private void UpdatePursuitBlockedState(float dt)
     {
-        if (_motor.IsBlocked)
+        // A brief gait veto or turn is not evidence of a bad route. Replan
+        // only after sustained lack of translation while intending to advance.
+        float alignment = Vector3.Dot(_motor.Forward, _travelDirection);
+        if (_commandSpeed > 0.5f && _motor.CurrentSpeed < 0.15f && alignment > 0.7f)
             _pursuitBlockedTimer += dt;
         else
             _pursuitBlockedTimer = MathF.Max(
@@ -483,10 +581,11 @@ public sealed class SpiderPatrol : IGizmoDrawable
             return;
         }
 
+        State = SpiderAiState.Recovering;
         _pursuitPlanner.AbandonPlan();
         _motor.ClearTransitionConstraint();
         _pursuitBlockedTimer = 0f;
-        CurrentSpeed = 0f;
+        _commandSpeed = 0f;
     }
 
     private void SyncTransitionConstraint(
@@ -497,6 +596,13 @@ public sealed class SpiderPatrol : IGizmoDrawable
         Vector3 targetSurfaceNormal = default,
         BodyID targetSurfaceBodyId = default)
     {
+        if (_pursuitPlanner.IsSameSurfaceDetourActive)
+        {
+            _motor.SetTransitionConstraint(_motor.SurfaceNormal);
+            _motor.ClearTransitionGuide();
+            return;
+        }
+
         // Near the final surface, use the resolved target contact itself as a
         // deterministic guide. This is especially important for an elevated
         // floor: the wall transition should finish on that floor rather than
@@ -524,7 +630,11 @@ public sealed class SpiderPatrol : IGizmoDrawable
         }
         else
         {
-            _motor.ClearTransitionConstraint();
+            if (hasTargetSurface && !IsDifferentSurface(_motor.SurfaceContact, _motor.SurfaceNormal,
+                    targetSurfacePoint, targetSurfaceNormal, targetSurfaceBodyId, _motor.Clearance))
+                _motor.SetTransitionConstraint(_motor.SurfaceNormal);
+            else
+                _motor.ClearTransitionConstraint();
             _motor.ClearTransitionGuide();
         }
     }
@@ -599,13 +709,13 @@ public sealed class SpiderPatrol : IGizmoDrawable
     private void UpdateSpeedTowardLimit(float dt, float speedLimit)
     {
         speedLimit = System.Math.Clamp(speedLimit, 0f, MoveSpeed);
-        if (CurrentSpeed < speedLimit)
-            CurrentSpeed = MathF.Min(speedLimit, CurrentSpeed + Acceleration * dt);
+        if (_commandSpeed < speedLimit)
+            _commandSpeed = MathF.Min(speedLimit, _commandSpeed + Acceleration * dt);
         else
-            CurrentSpeed = MathF.Max(speedLimit, CurrentSpeed - Deceleration * dt);
+            _commandSpeed = MathF.Max(speedLimit, _commandSpeed - Deceleration * dt);
 
         // Never allow one simulation step to pass beyond the active waypoint.
-        CurrentSpeed = MathF.Min(CurrentSpeed, speedLimit);
+        _commandSpeed = MathF.Min(_commandSpeed, speedLimit);
     }
 
     private void BeginWalking()
@@ -618,9 +728,17 @@ public sealed class SpiderPatrol : IGizmoDrawable
             forward * MathF.Cos(angle) + right * MathF.Sin(angle),
             forward);
 
-        float minimum = MathF.Min(MinTravelDistance, MathF.Max(1f, PatrolRadius));
-        _remainingTravel = minimum + (float)s_random.NextDouble() * MathF.Max(0.5f, PatrolRadius - minimum);
-        _targetPosition = _enemy.Body.Position(_physics) + _travelDirection * _remainingTravel;
+        float radius = MathF.Max(1f, PatrolRadius);
+        Vector3 position = _enemy.Body.Position(_physics);
+        Vector3 fromHome = ProjectOnPlane(position - _patrolOrigin, normal);
+        if (fromHome.LengthSquared() > radius * radius * 0.49f)
+            _travelDirection = NormalizeOrFallback(-fromHome, forward);
+        float minimum = MathF.Min(MinTravelDistance, radius);
+        float desiredTravel = minimum + (float)s_random.NextDouble() * MathF.Max(0.5f, radius - minimum);
+        float along = Vector3.Dot(fromHome, _travelDirection);
+        float boundary = -along + MathF.Sqrt(MathF.Max(0f, along * along + radius * radius - fromHome.LengthSquared()));
+        _remainingTravel = MathF.Min(desiredTravel, MathF.Max(0.1f, boundary - 0.25f));
+        _targetPosition = position + _travelDirection * _remainingTravel;
         _blockedTimer = 0f;
         _waitTimer = 0f;
         _state = PatrolState.Walking;
@@ -630,7 +748,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
     private void BeginIdle(float? minimumWait = null, float? maximumWait = null)
     {
         _state = PatrolState.Idle;
-        CurrentSpeed = 0f;
+        _commandSpeed = 0f;
         CurrentVelocity = Vector3.Zero;
         _waitTimer = 0f;
         _blockedTimer = 0f;
@@ -749,7 +867,7 @@ public sealed class SpiderPatrol : IGizmoDrawable
         float planeSeparation = MathF.Abs(Vector3.Dot(
             targetPoint - currentContact.Point,
             currentNormal));
-        float planeTolerance = MathF.Max(0.85f, clearance * 2.25f);
+        float planeTolerance = MathF.Max(0.1f, clearance * 0.2f);
         if (!float.IsFinite(planeSeparation) ||
             planeSeparation > planeTolerance)
         {
