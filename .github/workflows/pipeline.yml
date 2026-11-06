@@ -1,0 +1,37 @@
+name: Pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore solution
+        run: dotnet restore FuseEngine.slnx
+
+      - name: Build solution
+        run: dotnet build FuseEngine.slnx --configuration Release --no-restore --warnaserror
+
+      - name: Build and run all test harnesses
+        shell: pwsh
+        run: ./tests/run-all.ps1
+
+      - name: Check whitespace errors
+        run: git diff --check
